@@ -8,7 +8,7 @@ This is **not** a replacement for GDB or OpenOCD. The worker runs OpenOCD **on t
 
 ```text
 Oberon (Linux)
-  Pi coding agent ------ HTTP :8766/mcp ----> rpi5 OpenOCD MCP worker
+  Pi coding agent ------ HTTP :8766/mcp ----> edge.local OpenOCD MCP worker
   gdb-multiarch -------- TCP  :3333 -------> OpenOCD GDB server
   ATfE Build/Project.elf (stays on Oberon)       |
                                                  USB CMSIS-DAP Debug Probe
@@ -23,7 +23,7 @@ MCP is the control plane; native remote GDB is the interactive debugging plane. 
 sudo apt update
 sudo apt install -y python3 python3-venv openocd usbutils gdb-multiarch
 # Clone or unpack this dedicated repo on the Pi:
-cd ~/rpi5-openocd-mcp-worker
+cd ~/workspace/rpi5-openocd-mcp-worker  # example checkout location on edge
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 ./start.sh
@@ -52,7 +52,7 @@ The Raspberry Pi 5 is named `edge`; use its LAN/mDNS hostname `edge.local`, or i
 | --- | --- |
 | `diagnose_host` | Read-only Pi host/USB/OpenOCD diagnostics, no target contact |
 | `probe_target` | **Halts MCU**, reads target ID and flash capacity; no erase/program |
-| `fault_snapshot` | **Halts MCU**, records Cortex-M3 registers and fault status; no reset/program |
+| `fault_snapshot` | **Halts MCU** and reads fault status; CPU-register values are not yet reliably returned by the current tool (see verified findings below). No reset/program |
 | `start_gdb_server` | Start one persistent OpenOCD process for remote GDB on `:3333` |
 | `gdb_server_status` | Report server state, PID and recent OpenOCD logs |
 | `stop_gdb_server` | Stop persistent OpenOCD process |
@@ -63,9 +63,61 @@ The optional `quirk=true` parameter requests OpenOCD CMSIS-DAP single-packet com
 
 **Flash normally via GDB `load` instead of passing a large HEX through MCP**: it works directly with the ELF on Oberon, retains debug symbols, and avoids a file transfer. `stage_hex`/`flash_hex` are optional for agent-controlled program/verify tests and perform capacity/hash checks.
 
+## Verified hardware and remote-debugging results (2026-11-03)
+
+**Host:** Raspberry Pi 5 `edge` / `edge.local` (Linux ARM64); **workstation:** Oberon; **debug adapter:** Raspberry Pi Debug Probe, USB VID:PID `2e8a:000c`; **SWD target:** STM32F103 BU03/BU04. These are owner-reported live hardware tests, not just mock tests.
+
+| Check | Observed result |
+| --- | --- |
+| OpenOCD | `0.12.0+dev-snapshot (2026-02-16-16:07)`; `interface/cmsis-dap.cfg` and `target/stm32f1x.cfg` installed |
+| USB and SWD | CMSIS-DAPv2, SWD DPIDR `0x1ba01477`, Cortex-M3 `r1p1`; target examination succeeded |
+| STM32 device | OpenOCD ID `0x20036410` (reported medium density, revision Y); detected **128 KiB flash at 0x08000000** |
+| Probe/MCP | `diagnose_host` passed; `probe_target(speed_khz=1000)` passed; nonfatal “unknown state when halt was requested” and deprecated-command warnings were seen |
+| Flashing | **Direct OpenOCD CLI**, not the MCP `flash_hex` method, successfully programmed, verified (`Verified OK`), and reset the original `BU03_BU04_AT_V1.0.1_T2026-09-02.hex` |
+| Programming speed | An initial `adapter speed 5000` request reported an actual clock of **1000 kHz**; programming and verification succeeded |
+| Original firmware UART | Minicom `AT` → `OK`; `AT+PDOAGETCFG` → `Dlist:1 KList:1 Net:1111 AncID:65535`; `AT+GETKLIST` returned an empty list. The separate configuration CLI exported firmware `V1.0.1` with build date `Sep 2 2026 17:35:08` |
+| MCP fault snapshot | `fault_snapshot(speed_khz=1000)` returned **fault status** but reported register names without CPU-register values: a known tool limitation |
+| MCP GDB server | `start_gdb_server(speed_khz=1000, port=3333)` succeeded; status indicated listening on 3333 |
+| Remote GDB | `gdb-multiarch` on Oberon connected using `target extended-remote edge.local:3333`, read CPU registers and flash instructions, and executed `monitor resume` followed by `detach` |
+
+The GDB session, **without loading a mismatched ELF**, observed `pc=0x0800d25c`, `msp=0x20004e80`, and a vector table starting with `0x20004f30` at `0x08000000`. This confirms live register and memory access; the instruction address is **not** a source location in the historical 2024 AXF. The 2026 HEX has no matching symbol-rich ELF in the project.
+
+**Fault-status interpretation:** In the captured session `CFSR=0` and `HFSR=0`, indicating no set fault-status bits at that moment. The observed MMFAR/BFAR contents varied between captures, and the corresponding CFSR validity bits were clear, so those values **must not be interpreted as valid fault addresses**.
+
+**Known limitations:** The current worker `fault_snapshot` uses OpenOCD's bare `reg` command; with this installed OpenOCD version the observed snapshot did not provide numeric PC/SP/general-register values. Until fixed and verified, use GDB `info registers` or explicit OpenOCD register reads. The 2026 firmware was verified as programmed and AT-responsive; **PDoA ranging and ATfE on-target execution are not yet verified**. The worker's `stage_hex`/`flash_hex` endpoints have not been hardware-tested.
+
+### Reproduce a non-flashing GDB inspection
+
+Start the MCP worker on `edge` with `./start.sh`. From the Pi coding agent on Oberon, call `diagnose_host`, then `probe_target(speed_khz=1000)`, optionally `fault_snapshot(speed_khz=1000)`, and finally `start_gdb_server(speed_khz=1000, port=3333)`. **The target-probe and fault-snapshot calls halt the MCU**; the server owns the SWD probe afterward, so do not run additional standalone OpenOCD sessions until it stops.
+
+On Oberon, while the **original 2026 HEX** is running, use GDB **without an executable file**:
+
+```bash
+gdb-multiarch -q
+```
+
+```gdb
+target extended-remote edge.local:3333
+monitor halt
+info registers
+x/8wx 0x08000000
+x/8i $pc
+monitor mdw 0xE000ED28 1   # CFSR
+monitor mdw 0xE000ED2C 1   # HFSR
+monitor mdw 0xE000ED34 1   # MMFAR (only if valid)
+monitor mdw 0xE000ED38 1   # BFAR (only if valid)
+monitor resume
+detach
+quit
+```
+
+Ask the coding agent to call `stop_gdb_server` once disconnected. Recheck `AT` on the UART to verify normal execution; that final post-debug AT response is a **follow-up test**, not yet recorded as passed.
+
+For **future ATfE source-level debugging**, open the locally built `Project.elf` only when it corresponds to the firmware actually programmed on the target. **Do not load `Projects/USER/Output/Project.axf` as symbols for the running 2026 HEX**: it belongs to the different 2024 build. A GDB `load` command **programs flash** and is not part of this read-only test.
+
 ## GDB workflow from Oberon
 
-First, ask Pi coding agent to call `diagnose_host`, then `probe_target`, then `start_gdb_server`. Confirm that physical STM32 flash is **128 KiB**, because the current full ATfE firmware is larger than 64 KiB. On Oberon:
+First, ask Pi coding agent to call `diagnose_host`, then `probe_target`, then `start_gdb_server`. **This target was measured at 128 KiB flash**; always recheck capacity for another board. The following example is for a **future matching ATfE build**, not the currently running original 2026 HEX. On Oberon:
 
 ```bash
 ./tools/build-atfe.sh debug 128
@@ -98,11 +150,11 @@ OpenOCD supports `monitor` commands over the existing GDB connection. Do **not**
 
 ## Firmware validation order
 
-1. Check probe firmware / USB enumeration and reproduce the known failure at 100 kHz.
-2. `probe_target` without writing flash; record the STM32 flash size and USB errors.
-3. Start remote GDB and debug the known-good vendor firmware on a spare or backed-up board.
-4. Debug minimal `firmware_core.elf` to isolate startup, stack, clock, SysTick and interrupts.
-5. Debug full `Project.elf`, collecting CFSR/HFSR and PCs before resetting. Compare ST libraries, runtime initialization and vendor archive ABI behavior.
+1. **Completed:** USB CMSIS-DAP/SWD target detection; record 128 KiB flash size and device ID.
+2. **Completed:** direct OpenOCD programming/verification of the original 2026 HEX and AT UART baseline.
+3. **Completed:** MCP diagnostics/target probe/GDB server; Oberon remote GDB register, memory, disassembly and detach checks.
+4. **Outstanding:** fix numeric CPU-register capture in `fault_snapshot` and verify it on the live device.
+5. **Next:** debug minimal `firmware_core.elf` and full ATfE `Project.elf` only after explicitly authorized programming and with a matching symbol file; investigate startup/stack/clock/interrupts/ABI.
 
 ## Tests and scope
 
@@ -111,7 +163,7 @@ python3 -m unittest discover -s tests -v
 python3 -m py_compile server.py worker_core.py
 ```
 
-Unit tests mock OpenOCD and do not connect to physical hardware. **Live Pi 5 probe, OpenOCD MCP transport and STM32 flashing are not yet verified.** The service is intentionally unauthenticated and unencrypted for the trusted local LAN, as requested. It can halt the target and optionally write flash; keep port 8766 on that LAN. There are **no GitHub Actions workflows** and nothing starts automatically after reboot.
+Unit tests mock OpenOCD. **Live Pi 5 USB/SWD access, MCP diagnostics/probe/GDB-server control, remote GDB, and direct OpenOCD programming plus verification of the reference HEX are now verified on hardware (2026-11-03).** The MCP flash endpoints and ATfE firmware runtime remain unverified. The service is intentionally unauthenticated and unencrypted for the trusted local LAN, as requested. It can halt the target and optionally write flash; keep port 8766 on that LAN. There are **no GitHub Actions workflows** and nothing starts automatically after reboot.
 
 ## Repository role
 
