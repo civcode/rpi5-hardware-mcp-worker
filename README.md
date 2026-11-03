@@ -2,7 +2,7 @@
 
 A minimal **plain-LAN-HTTP** Model Context Protocol worker for the **Raspberry Pi Debug Probe / Pico with debugprobe firmware** attached over USB to a Raspberry Pi 5, debugging an STM32F103 BU03/BU04 over SWD.
 
-This is **not** a replacement for GDB or OpenOCD. The worker runs OpenOCD **on the Pi**, offers a few Pi coding agent tools, and starts/stops an OpenOCD **GDB TCP server on port 3333**. GDB on the Oberon workstation can connect directly to `rpi5:3333` and use the **local ATfE ELF with symbols**. It does not require SSH, TLS, a service manager, or a checkout of the SDK on the Pi.
+This is **not** a replacement for GDB or OpenOCD. The worker runs OpenOCD **on the Pi**, offers a few Pi coding agent tools, and starts/stops an OpenOCD **GDB TCP server on port 3333**. GDB on the Oberon workstation can connect directly to `edge.local:3333` and use the **local ATfE ELF with symbols**. It does not require SSH, TLS, a service manager, or a checkout of the SDK on the Pi.
 
 ## Architecture
 
@@ -29,7 +29,7 @@ python3 -m venv .venv
 ./start.sh
 ```
 
-The console process listens on `0.0.0.0:8766` and exposes `http://rpi5:8766/mcp`. Ctrl+C stops it. No systemd unit is required. Use `RPI5_MCP_HOST`, `RPI5_MCP_PORT` and `OPENOCD` environment variables if needed.
+The console process listens on `0.0.0.0:8766` and exposes `http://edge.local:8766/mcp`. Ctrl+C stops it. No systemd unit is required. Use `RPI5_MCP_HOST`, `RPI5_MCP_PORT` and `OPENOCD` environment variables if needed.
 
 Test without the worker: `openocd -f interface/cmsis-dap.cfg -c 'transport select swd' -f target/stm32f1x.cfg -c 'adapter speed 100' -c 'init' -c 'halt' -c 'shutdown'`.
 
@@ -40,11 +40,11 @@ The official Debug Probe **D** cable uses **orange = SWCLK**, **black = GND**, *
 ## Configure Pi coding agent on Oberon
 
 ```bash
-pi mcp add rpi5-openocd --url http://rpi5:8766/mcp
+pi mcp add rpi5-openocd --url http://edge.local:8766/mcp
 pi mcp list
 ```
 
-Use the Pi 5's IP address instead of `rpi5` if name resolution is not configured. The included `pi-mcp.json` is an example user/project MCP configuration. Keep the existing `armcc5` worker on port **8765** and this one on port **8766**.
+The Raspberry Pi 5 is named `edge`; use its LAN/mDNS hostname `edge.local`, or its IP address if `edge.local` does not resolve from Oberon. The included `pi-mcp.json` is an example user/project MCP configuration. Keep the existing `armcc5` worker on port **8765** and this one on port **8766**.
 
 ## MCP tools
 
@@ -76,7 +76,7 @@ gdb-multiarch build/atfe-debug/Project.elf
 Inside GDB:
 
 ```gdb
-target extended-remote rpi5:3333
+target extended-remote edge.local:3333
 monitor halt
 info registers
 monitor mdw 0xE000ED28 1   # CFSR
