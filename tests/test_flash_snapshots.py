@@ -64,6 +64,44 @@ class SnapshotTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["flash_kib"], 64)
 
+    def test_openocd_hex_capacity_128_kib_is_accepted(self):
+        result = self.capture(
+            self.first, output="FLASH_SNAPSHOT_KIB=0x80\nFLASH_SNAPSHOT_DUMP_OK\nFLASH_SNAPSHOT_RESUME_OK\n")
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["flash_kib"], 128)
+        self.assertEqual(result["length"], 131072)
+        self.assertEqual(self.store.info(result["snapshot_id"])["sha256"],
+                         hashlib.sha256(self.first).hexdigest())
+
+    def test_openocd_hex_capacity_64_kib_is_accepted(self):
+        result = self.capture(
+            self.first[:65536], kib=64,
+            output="FLASH_SNAPSHOT_KIB=0x40\nFLASH_SNAPSHOT_DUMP_OK\nFLASH_SNAPSHOT_RESUME_OK\n")
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["flash_kib"], 64)
+
+    def test_hex_capacity_still_rejects_unsupported_size(self):
+        result = self.capture(
+            self.first, output="FLASH_SNAPSHOT_KIB=0x100\nFLASH_SNAPSHOT_DUMP_OK\nFLASH_SNAPSHOT_RESUME_OK\n")
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["resumed"])
+        self.assertEqual(self.store.list_snapshots()["total"], 0)
+
+    def test_hex_capacity_still_rejects_incorrect_dump_length(self):
+        result = self.capture(
+            self.first[:65536], output="FLASH_SNAPSHOT_KIB=0x80\nFLASH_SNAPSHOT_DUMP_OK\nFLASH_SNAPSHOT_RESUME_OK\n")
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["resumed"])
+        self.assertIn("size", result["error"])
+        self.assertEqual(result["expected_bytes"], 131072)
+        self.assertEqual(self.store.list_snapshots()["total"], 0)
+
+    def test_capacity_does_not_accept_partial_numeric_marker(self):
+        result = self.capture(
+            self.first, output="FLASH_SNAPSHOT_KIB=0x800\nFLASH_SNAPSHOT_DUMP_OK\nFLASH_SNAPSHOT_RESUME_OK\n")
+        self.assertFalse(result["ok"])
+        self.assertEqual(self.store.list_snapshots()["total"], 0)
+
     def test_resume_missing_is_not_saved(self):
         result = self.capture(self.first, output="FLASH_SNAPSHOT_KIB=128\nFLASH_SNAPSHOT_DUMP_OK\n")
         self.assertFalse(result["ok"])
