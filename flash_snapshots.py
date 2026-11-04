@@ -16,7 +16,6 @@ from pathlib import Path
 import re
 import struct
 import subprocess
-import tempfile
 import uuid
 
 
@@ -262,3 +261,60 @@ class FlashSnapshotStore:
                 "bytes": len(piece), "chunk_sha256": _sha(piece),
                 "snapshot_sha256": info["sha256"], "total_bytes": len(data),
                 "base64": base64.b64encode(piece).decode("ascii")}
+
+    def diff_chunk(self, diff_id: str, format: str = "csv",
+                   offset: int = 0, length: int = 4096) -> dict:
+        """Retrieve a bounded stored CSV or JSON diff report, with integrity hash."""
+        import base64
+        _check_id(diff_id)
+        if format not in ("csv", "json"):
+            raise SnapshotError("format must be csv or json")
+        if type(offset) is not int or offset < 0:
+            raise SnapshotError("offset must be non-negative")
+        if type(length) is not int or not 1 <= length <= 8192:
+            raise SnapshotError("length must be between 1 and 8192")
+        path = self.directory / f"diff-{diff_id}.{format}"
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            raise SnapshotError(f"Diff report unavailable: {diff_id}") from exc
+        if offset >= len(data):
+            raise SnapshotError("offset exceeds diff report length")
+        piece = data[offset:offset + length]
+        return {"ok": True, "diff_id": diff_id, "format": format,
+                "offset": offset, "bytes": len(piece), "total_bytes": len(data),
+                "report_sha256": _sha(data), "chunk_sha256": _sha(piece),
+                "base64": base64.b64encode(piece).decode("ascii")}
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Offline comparison of existing raw binary backups; no hardware involved."""
+    import argparse
+    parser = argparse.ArgumentParser(description="Compare STM32 raw main-flash .bin backups offline")
+    parser.add_argument("before", type=Path)
+    parser.add_argument("after", type=Path)
+    parser.add_argument("--csv", type=Path, help="write changed-byte CSV")
+    parser.add_argument("--json", type=Path, help="write full range JSON")
+    args = parser.parse_args(argv)
+    before = args.before.read_bytes()
+    after = args.after.read_bytes()
+    if len(before) not in tuple(k * 1024 for k in ALLOWED_FLASH_KIB):
+        parser.error("expected a complete 64- or 128-KiB STM32 main-flash image")
+    report = analyze_difference(before, after)
+    report["before_sha256"] = _sha(before)
+    report["after_sha256"] = _sha(after)
+    if args.csv:
+        _write_diff_csv(args.csv, before, after, FLASH_START)
+    if args.json:
+        args.json.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps({"changed_bytes": report["changed_bytes"],
+                      "range_count": len(report["ranges"]),
+                      "changed_pages": report["changed_pages"],
+                      "first_64_ranges": report["ranges"][:64],
+                      "before_sha256": report["before_sha256"],
+                      "after_sha256": report["after_sha256"]}, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
