@@ -286,13 +286,13 @@ class OpenOCDWorker:
                     "mdw 0xE000ED34 1", "mdw 0xE000ED38 1", "shutdown"]
         return self._one_shot(speed_khz, commands, timeout=30, quirk=quirk)
 
-    def gdb_command(self, command: str, auth_token: str, timeout_seconds: int = 30) -> dict:
+    def gdb_command(self, command: str, timeout_seconds: int = 30) -> dict:
         """Send a command to the owned, persistent local GDB process."""
         with self._lock:
             if not self._server_running():
                 self._gdb_client.close()
                 return {"ok": False, "error": "OpenOCD server unavailable; start_gdb_server is required"}
-            return self._gdb_client.command(command, self._port, auth_token, timeout_seconds)
+            return self._gdb_client.command(command, self._port, timeout_seconds)
 
     def start_gdb_server(self, speed_khz: int = 100, port: int = 3333, quirk: bool = False) -> dict:
         validate_speed(speed_khz)

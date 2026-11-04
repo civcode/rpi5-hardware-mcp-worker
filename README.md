@@ -95,7 +95,7 @@ The Raspberry Pi 5 is named `edge`; use its LAN/mDNS hostname `edge.local`, or i
 | `fault_snapshot` | **Halts MCU** and reads fault status; CPU-register values are not yet reliably returned by the current tool (see verified findings below). No reset/program |
 | `start_gdb_server` | Start one persistent OpenOCD process for remote GDB on `:3333` |
 | `gdb_server_status` | Report server state, PID and recent OpenOCD logs |
-| `gdb_command` | Persistent GDB console/MI command transport, with operator token |
+| `gdb_command` | Persistent GDB console/MI command transport; no token required |
 | `stop_gdb_server` | Stop persistent OpenOCD process |
 | `stage_hex` | Stage an Intel HEX image sent as base64; checks checksums, address range and SHA-256; **does not flash** |
 | `staged_hex_info` | Rehash a staged HEX and return its generated OpenOCD path; **does not access the target** |
@@ -116,15 +116,15 @@ The optional `quirk=true` parameter requests OpenOCD CMSIS-DAP single-packet com
 
 ### MCP GDB command transport
 
-The `gdb_command(command, auth_token, timeout_seconds=30)` tool forwards GDB
+The `gdb_command(command, timeout_seconds=30)` tool forwards GDB
 console commands or native MI commands (prefixed with `-`) through a persistent
 `gdb-multiarch` session on the Pi. Start OpenOCD using `start_gdb_server` first.
 Use an empty command to poll pending MI output; `stop_gdb_server` ends the session.
 
-Set `RPI5_GDB_COMMAND_TOKEN` in the worker environment to a random secret
-of at least 32 characters, and supply it as `auth_token` in each call.
-No command allowlist is enforced: commands can affect the Pi and the MCU.
-The MCP HTTP connection is plaintext; keep access restricted to trusted clients.
+No token or command allowlist is required. Commands can affect the Pi and
+MCU, including writing memory or programming flash. The MCP HTTP endpoint
+is plaintext and should remain reachable only from the protected development
+network. Avoid exposing port 8766 to untrusted clients.
 On a command timeout the client session is closed and the target state is unknown.
 
 ## USB-UART and AT commands

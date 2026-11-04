@@ -46,68 +46,62 @@ class TestLocalGDB(unittest.TestCase):
         self.executable.write_text(STUB.format(python=os.sys.executable))
         self.executable.chmod(0o755)
         self.gdb = LocalGDB(executable=str(self.executable))
-        self.patcher = patch.dict(os.environ, {"RPI5_GDB_COMMAND_TOKEN": "a" * 40})
-        self.patcher.start()
 
     def tearDown(self):
         self.gdb.close()
-        self.patcher.stop()
         self.tmp.cleanup()
 
     def test_console_commands_are_preserved_and_session_persists(self):
-        first = self.gdb.command('set print pretty on', 3333, 'a' * 40)
+        first = self.gdb.command('set print pretty on', 3333)
         self.assertTrue(first['ok'], first)
         self.assertIn("command='set print pretty on' count=1", first['output'])
-        second = self.gdb.command('set args --foo "bar"', 3333, 'a' * 40)
+        second = self.gdb.command('set args --foo "bar"', 3333)
         self.assertTrue(second['ok'], second)
         self.assertIn('count=2', second['output'])
         self.assertEqual(first['gdb_pid'], second['gdb_pid'])
 
     def test_native_mi_command_and_async_running(self):
-        start = self.gdb.command('continue', 3333, 'a' * 40)
+        start = self.gdb.command('continue', 3333)
         self.assertTrue(start['ok'], start)
         self.assertEqual(start['result_class'], 'running')
-        stop = self.gdb.command('-exec-interrupt', 3333, 'a' * 40)
+        stop = self.gdb.command('-exec-interrupt', 3333)
         self.assertTrue(stop['ok'], stop)
         self.assertIn('stopped', stop['output'])
 
     def test_error_does_not_reset_session(self):
-        err = self.gdb.command('fail', 3333, 'a' * 40)
+        err = self.gdb.command('fail', 3333)
         self.assertFalse(err['ok'])
         self.assertEqual(err['error'], 'GDB command failed')
-        self.assertTrue(self.gdb.command('info registers', 3333, 'a' * 40)['ok'])
+        self.assertTrue(self.gdb.command('info registers', 3333)['ok'])
 
     def test_quit_restarts_at_next_command(self):
-        first = self.gdb.command('quit', 3333, 'a' * 40)
+        first = self.gdb.command('quit', 3333)
         self.assertFalse(first['ok'])
         self.assertFalse(self.gdb.running())
-        self.assertTrue(self.gdb.command('info breakpoints', 3333, 'a' * 40)['ok'])
+        self.assertTrue(self.gdb.command('info breakpoints', 3333)['ok'])
 
     def test_timeout_closes_client_and_reports_unknown_target_state(self):
-        result = self.gdb.command('timeout test', 3333, 'a' * 40, timeout_seconds=1)
+        result = self.gdb.command('timeout test', 3333, timeout_seconds=1)
         self.assertFalse(result['ok'])
         self.assertEqual(result['target_state'], 'unknown')
         self.assertFalse(self.gdb.running())
 
     def test_reject_bad_timeout_and_multiline_native_mi(self):
         with self.assertRaises(ValueError):
-            self.gdb.command('info registers', 3333, 'a' * 40, timeout_seconds=0)
-        result = self.gdb.command('-exec-continue\n-exec-interrupt', 3333, 'a' * 40)
+            self.gdb.command('info registers', 3333, timeout_seconds=0)
+        result = self.gdb.command('-exec-continue\n-exec-interrupt', 3333)
         self.assertFalse(result['ok'])
         self.assertIn('one line', result['error'])
 
-    def test_requires_authorization_before_process_start(self):
-        denied = self.gdb.command("info registers", 3333, "wrong")
-        self.assertFalse(denied["ok"])
-        self.assertFalse(self.gdb.running())
+    def test_no_auth_token_needed(self):
         with patch.dict(os.environ, {"RPI5_GDB_COMMAND_TOKEN": ""}):
-            disabled = self.gdb.command("info registers", 3333, "a" * 40)
-        self.assertFalse(disabled["ok"])
-        self.assertFalse(self.gdb.running())
+            result = self.gdb.command("info registers", 3333)
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(self.gdb.running())
 
     def test_missing_gdb_reports_error(self):
         with patch('gdb_local.shutil.which', return_value=None):
-            result = self.gdb.command('info registers', 3333, 'a' * 40)
+            result = self.gdb.command('info registers', 3333)
         self.assertFalse(result['ok'])
         self.assertIn('not found', result['error'])
 

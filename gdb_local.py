@@ -1,13 +1,11 @@
 """Persistent GDB/MI command transport for worker-managed OpenOCD.
 
 Commands are forwarded verbatim to GDB's console interpreter, or as native
-MI commands when prefixed with '-'.  A secret operator token is required for
-each call because the GDB command language can modify the host and target.
+MI commands when prefixed with '-'. The GDB command language can modify the host and target.
 """
 from __future__ import annotations
 
 import ast
-import hmac
 import json
 import os
 import queue
@@ -172,13 +170,8 @@ class LocalGDB:
                 return {"ok": False, "error": f"Cannot initialize GDB with {command}: {result.get('error', result.get('raw_mi'))}"}
         return {"ok": True}
 
-    def command(self, command: str, port: int, auth_token: str, timeout_seconds: int = 30) -> dict:
+    def command(self, command: str, port: int, timeout_seconds: int = 30) -> dict:
         """Forward one full GDB CLI or native MI command; empty string polls output."""
-        secret = os.getenv("RPI5_GDB_COMMAND_TOKEN", "")
-        if len(secret) < 32:
-            return {"ok": False, "error": "GDB command forwarding disabled: set RPI5_GDB_COMMAND_TOKEN to a random 32+ character secret"}
-        if type(auth_token) is not str or not hmac.compare_digest(auth_token, secret):
-            return {"ok": False, "error": "Invalid GDB authorization token"}
         if type(command) is not str:
             raise ValueError("command must be a string")
         if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 300:
