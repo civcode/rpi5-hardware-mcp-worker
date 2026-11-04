@@ -74,7 +74,7 @@ class SerialCoreTests(unittest.TestCase):
 
     def test_queries_are_strict_allowlist(self):
         worker, instances = self.make_worker()
-        for s in ("AT+RESTORE", "AT+SETCFG=1", "AT\r\nAT+RESET", "at", "AT+GETVER\n"):
+        for s in ("AT+RESTORE", "AT+SAVE", "AT+SETCFG=1", "AT\r\nAT+RESET", "at", "AT+GETVER\n"):
             with self.assertRaises(SerialError):
                 worker.serial_at_query(command=s)
         self.assertEqual(instances, [])
@@ -90,6 +90,28 @@ class SerialCoreTests(unittest.TestCase):
         self.assertEqual(instances[0].writes, [b"AT+GETKLIST\r\n"])
         self.assertEqual(instances[0].wire_settings, (False, False))
         self.assertTrue(instances[0].closed)
+
+    def test_split_terminal_crlf_is_preserved_before_close(self):
+        class SplitReplySerial(FakeSerial):
+            def read(self, n):
+                result = super().read(n)
+                if result.endswith(b"OK\r"):
+                    self._rx.extend(b"\n")
+                return result
+
+        instances = []
+
+        def factory(**kwargs):
+            instance = SplitReplySerial(reply=b"version\r\nOK\r")
+            instances.append(instance)
+            return instance
+
+        worker = SerialWorker(ports=("/dev/ttyUSB0",), factory=factory)
+        result = worker.serial_at_query("AT+GETVER", quiet_ms=50, timeout_ms=500)
+        self.assertEqual(bytes.fromhex(result["rx_hex"]), b"version\r\nOK\r\n")
+        self.assertEqual(base64.b64decode(result["rx_base64"]), b"version\r\nOK\r\n")
+        self.assertEqual(result["status"], "OK")
+        self.assertEqual(instances[0]._rx, b"")
 
     def test_chatter_prevents_query_and_retains_bytes(self):
         worker, instances = self.make_worker(pre=b"unsolicited\n")

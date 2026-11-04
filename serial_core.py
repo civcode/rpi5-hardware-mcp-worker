@@ -12,6 +12,8 @@ from typing import Callable
 
 MAX_RX = 4096
 MAX_TX = 256
+# Give a split CRLF and immediately trailing UART bytes time to arrive.
+TERMINAL_SETTLE_SECONDS = 0.1
 READ_ONLY_AT = frozenset({
     "AT", "AT+GETVER", "AT+GETCFG", "AT+GETDEV", "AT+GETUWBMODE",
     "AT+PDOAGETCFG", "AT+GETDLIST", "AT+GETKLIST",
@@ -88,16 +90,19 @@ class SerialWorker:
         deadline = time.monotonic() + duration_ms / 1000
         data = bytearray()
         terminal = False
+        settle_deadline = None
         while time.monotonic() < deadline and len(data) < max_bytes:
+            if settle_deadline is not None and time.monotonic() >= settle_deadline:
+                break
             waiting = getattr(conn, "in_waiting", 0)
             piece = conn.read(min(max_bytes - len(data), max(1, waiting)))
             if not piece:
                 time.sleep(0.002)
                 continue
             data.extend(piece)
-            if stop_at_terminal and _TERMINAL.search(data):
+            if stop_at_terminal and (terminal or _TERMINAL.search(data)):
                 terminal = True
-                break
+                settle_deadline = time.monotonic() + TERMINAL_SETTLE_SECONDS
         return bytes(data), terminal, len(data) >= max_bytes
 
     @staticmethod
