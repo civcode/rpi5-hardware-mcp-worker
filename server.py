@@ -1,4 +1,4 @@
-"""Run a plain-HTTP MCP endpoint on the Raspberry Pi 5 USB debug host."""
+"""Run the plain-LAN-HTTP OpenOCD and USB-UART MCP tools on the Raspberry Pi."""
 from __future__ import annotations
 
 import atexit
@@ -7,15 +7,18 @@ import os
 from mcp.server import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from worker_core import OpenOCDWorker
+from serial_core import SerialWorker
 
 worker = OpenOCDWorker()
+serial_worker = SerialWorker(allow_writes=os.getenv("RPI5_SERIAL_ENABLE_WRITES") == "1")
 atexit.register(worker.close)
 
 mcp = MCPServer(
-    "rpi5-openocd",
-    instructions=("OpenOCD SWD probe for STM32F103. Read-only operations halt the MCU; "
-                  "flashing requires explicit confirmation. Use GDB on Oberon via TCP 3333 "
-                  "for breakpoints/stepping/source-level debug."),
+    "rpi5-hardware",
+    instructions=("USB CMSIS-DAP/OpenOCD and UART/AT tools for STM32F103 BU03/BU04. "
+                  "SWD probes halt the MCU; flashing requires explicit SHA-256 confirmation. "
+                  "AT queries use a read-only command allowlist. Raw/setting UART writes "
+                  "require RPI5_SERIAL_ENABLE_WRITES=1 and per-call confirmation."),
 )
 
 
@@ -66,6 +69,43 @@ def flash_hex(artifact_id: str, confirm_sha256: str, confirm: str = "", speed_kh
               quirk: bool = False) -> dict:
     """PROGRAM/verify staged HEX only with confirm='FLASH', verified hash, and detected flash capacity."""
     return worker.flash_hex(artifact_id, confirm_sha256, confirm, speed_khz, quirk)
+
+
+@mcp.tool()
+def serial_list_ports() -> dict:
+    """List configured USB serial ports and presence/USB identifiers, no transmit."""
+    return serial_worker.serial_list_ports()
+
+
+@mcp.tool()
+def serial_capture(port: str = "", baudrate: int = 115200,
+                   duration_ms: int = 1000, max_bytes: int = 4096) -> dict:
+    """Listen for UART bytes for a bounded interval, without transmitting bytes."""
+    return serial_worker.serial_capture(port, baudrate, duration_ms, max_bytes)
+
+
+@mcp.tool()
+def serial_at_query(command: str, port: str = "", baudrate: int = 115200,
+                    timeout_ms: int = 2500, max_bytes: int = 4096,
+                    quiet_ms: int = 150) -> dict:
+    """Send a recognized read-only AT command; return byte-exact response and status."""
+    return serial_worker.serial_at_query(command, port, baudrate, timeout_ms, max_bytes, quiet_ms)
+
+
+@mcp.tool()
+def serial_at_command(command: str, confirm: str = "", port: str = "",
+                      baudrate: int = 115200, timeout_ms: int = 2500,
+                      max_bytes: int = 4096) -> dict:
+    """Opt-in state-changing AT command; require confirm='AT_WRITE'."""
+    return serial_worker.serial_at_command(command, confirm, port, baudrate, timeout_ms, max_bytes)
+
+
+@mcp.tool()
+def serial_exchange(tx_base64: str, confirm: str = "", port: str = "",
+                    baudrate: int = 115200, timeout_ms: int = 1000,
+                    max_bytes: int = 4096) -> dict:
+    """Opt-in bounded raw UART transmit; require confirm='SEND'."""
+    return serial_worker.serial_exchange(tx_base64, confirm, port, baudrate, timeout_ms, max_bytes)
 
 
 if __name__ == "__main__":

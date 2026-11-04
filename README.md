@@ -1,21 +1,21 @@
-# Raspberry Pi 5 OpenOCD MCP worker
+# Raspberry Pi 5 hardware MCP worker
 
-A minimal **plain-LAN-HTTP** Model Context Protocol worker for the **Raspberry Pi Debug Probe / Pico with debugprobe firmware** attached over USB to a Raspberry Pi 5, debugging an STM32F103 BU03/BU04 over SWD.
+A **plain-LAN-HTTP** Model Context Protocol worker for Raspberry Pi 5 hardware access: OpenOCD/SWD through the Raspberry Pi Debug Probe and USB-UART/AT commands (default `/dev/ttyUSB0`) for the STM32F103 BU03/BU04 UWB kit.
 
-This is **not** a replacement for GDB or OpenOCD. The worker runs OpenOCD **on the Pi**, offers a few Pi coding agent tools, and starts/stops an OpenOCD **GDB TCP server on port 3333**. GDB on the Oberon workstation can connect directly to `edge.local:3333` and use the **local ATfE ELF with symbols**. It does not require SSH, TLS, a service manager, or a checkout of the SDK on the Pi.
+This is **not** a replacement for GDB or OpenOCD. The worker runs OpenOCD **on the Pi**, offers a few Pi coding agent tools, and starts/stops an OpenOCD **GDB TCP server on port 3333**. GDB on the Oberon workstation can connect directly to `edge.local:3333` and use the **local ATfE ELF with symbols**. It does not require SSH, TLS, a service manager, or a checkout of the SDK on the Pi. UART uses `pyserial` and shares the existing MCP endpoint.
 
 ## Architecture
 
 ```text
 Oberon (Linux)
-  Pi coding agent ------ HTTP :8766/mcp ----> edge.local OpenOCD MCP worker
+  Pi coding agent ------ HTTP :8766/mcp ----> edge.local hardware MCP worker
   gdb-multiarch -------- TCP  :3333 -------> OpenOCD GDB server
   ATfE Build/Project.elf (stays on Oberon)       |
                                                  USB CMSIS-DAP Debug Probe
                                                  SWD --> STM32F103 BU03/BU04
 ```
 
-MCP is the control plane; native remote GDB is the interactive debugging plane. **One OpenOCD process owns the physical probe at a time.** If the GDB server is active, standalone `probe_target`, `fault_snapshot` and `flash_hex` refuse to start another connection; use `monitor` in GDB or stop the GDB server first.
+MCP controls SWD and UART; native remote GDB is the interactive debugging plane. **One OpenOCD process owns the physical probe at a time.** If the GDB server is active, standalone `probe_target`, `fault_snapshot` and `flash_hex` refuse to start another connection; use `monitor` in GDB or stop the GDB server first.
 
 ## Install on Raspberry Pi 5 (headless Raspberry Pi OS)
 
@@ -23,7 +23,7 @@ MCP is the control plane; native remote GDB is the interactive debugging plane. 
 sudo apt update
 sudo apt install -y python3 python3-venv openocd usbutils gdb-multiarch
 # Clone or unpack this dedicated repo on the Pi:
-cd ~/workspace/rpi5-openocd-mcp-worker  # example checkout location on edge
+cd ~/workspace/rpi5-hardware-mcp-worker  # example checkout location on edge
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 ./start.sh
@@ -40,11 +40,11 @@ The official Debug Probe **D** cable uses **orange = SWCLK**, **black = GND**, *
 ## Configure Pi coding agent on Oberon
 
 ```bash
-pi mcp add rpi5-openocd --url http://edge.local:8766/mcp
+pi mcp add rpi5-hardware --url http://edge.local:8766/mcp
 pi mcp list
 ```
 
-The Raspberry Pi 5 is named `edge`; use its LAN/mDNS hostname `edge.local`, or its IP address if `edge.local` does not resolve from Oberon. The included `pi-mcp.json` is an example user/project MCP configuration. Keep the existing `armcc5` worker on port **8765** and this one on port **8766**.
+The Raspberry Pi 5 is named `edge`; use its LAN/mDNS hostname `edge.local`, or its IP address if `edge.local` does not resolve from Oberon. The included `pi-mcp.json` is an example user/project MCP configuration. Existing clients registered as `rpi5-openocd` can retain that name while using the same URL. Keep the existing `armcc5` worker on port **8765** and this one on port **8766**.
 
 ## MCP tools
 
@@ -58,10 +58,31 @@ The Raspberry Pi 5 is named `edge`; use its LAN/mDNS hostname `edge.local`, or i
 | `stop_gdb_server` | Stop persistent OpenOCD process |
 | `stage_hex` | Stage an Intel HEX image sent as base64; checks checksums, address range and SHA-256; **does not flash** |
 | `flash_hex` | Destructive: probe capacity, **erase/program/verify/reset** a staged image, only with matching SHA-256 plus `confirm="FLASH"` |
+| `serial_list_ports` | List configured USB serial devices and presence |
+| `serial_capture` | Bounded UART receive without transmission |
+| `serial_at_query` | Bounded read-only AT query, complete response and raw bytes |
+| `serial_at_command` | Opt-in AT configuration command, requires `confirm="AT_WRITE"` |
+| `serial_exchange` | Opt-in bounded Base64-encoded UART transmit, requires `confirm="SEND"` |
 
 The optional `quirk=true` parameter requests OpenOCD CMSIS-DAP single-packet compatibility mode (if supported by installed OpenOCD). `speed_khz` defaults to **100** to debug unreliable links. Official probe firmware v2.3.1 or v2.2.3 may be useful as a comparison when diagnosing Pi 5-specific issues.
 
 **Flash normally via GDB `load` instead of passing a large HEX through MCP**: it works directly with the ELF on Oberon, retains debug symbols, and avoids a file transfer. `stage_hex`/`flash_hex` are optional for agent-controlled program/verify tests and perform capacity/hash checks.
+
+## USB-UART and AT commands
+
+The UART tools use the existing plain-HTTP endpoint `http://edge.local:8766/mcp`. Network listeners remain unchanged (`0.0.0.0:8766`; GDB port 3333 when started). No authentication, TLS, or firewall changes are introduced.
+
+- Install dependencies in the Pi virtual environment: `.venv/bin/python -m pip install -r requirements.txt`; this includes `pyserial`.
+- Default serial port: `/dev/ttyUSB0`. Configure additional permitted device paths with `RPI5_SERIAL_PORTS=/dev/ttyUSB0,/dev/serial/by-id/your-adapter`. An empty `port` argument selects the first configured path.
+- Default UART: **115200 baud, 8N1**, no software or hardware flow control. Calls use finite timeouts, at most **4096 received bytes** and at most **256 transmitted bytes**.
+- `serial_list_ports()` reports presence and USB identifiers. `serial_capture(duration_ms=1000)` listens for unsolicited traffic without transmitting bytes.
+- `serial_at_query(command="AT+GETVER")` transmits `AT+GETVER\r\n` and returns `rx_base64`, `rx_hex`, `rx_gb18030`, `status` (`OK`, `ERROR`, or `INCOMPLETE`) and `complete`. Read-only allowlist: `AT`, `AT+GETVER`, `AT+GETCFG`, `AT+GETDEV`, `AT+GETUWBMODE`, `AT+PDOAGETCFG`, `AT+GETDLIST`, `AT+GETKLIST`. The quiet-window check refuses to transmit when unsolicited bytes are already present; use `serial_capture` to diagnose chatty firmware.
+- To enable setting changes, start the worker with `RPI5_SERIAL_ENABLE_WRITES=1 ./start.sh`, then call `serial_at_command(command="AT+RESTORE", confirm="AT_WRITE")`. For arbitrary bounded byte exchanges use `serial_exchange(tx_base64="...", confirm="SEND")`. Both methods are off by default. The per-call confirmation is an *operation guard*, not network authentication.
+- Raw Base64 and hex outputs preserve the exact received bytes; GB18030 text is display-only and may contain replacement characters. This is important for vendor AT responses containing control bytes.
+- The port is opened with POSIX exclusive access. Close Minicom and other serial processes first. The worker requests deasserted DTR/RTS before opening, but some USB UART drivers may generate transient line changes during open; whether this affects the target depends on wiring.
+- The [ai-thinker-bu03-bu04-uwb-kit](https://github.com/civcode/ai-thinker-bu03-bu04-uwb-kit) CLI remains available for high-level configuration/JSON export. The new tools provide lower-level serial/AT access, not full CLI feature parity.
+
+UART tools have offline unit tests using a fake serial port. **They have not yet been validated against a connected BU03/BU04**, and introducing them does not itself authorize a target operation.
 
 ## Verified hardware and remote-debugging results (2026-11-03)
 
@@ -160,13 +181,13 @@ OpenOCD supports `monitor` commands over the existing GDB connection. Do **not**
 
 ```bash
 python3 -m unittest discover -s tests -v
-python3 -m py_compile server.py worker_core.py
+python3 -m py_compile server.py worker_core.py serial_core.py
 ```
 
 Unit tests mock OpenOCD. **Live Pi 5 USB/SWD access, MCP diagnostics/probe/GDB-server control, remote GDB, and direct OpenOCD programming plus verification of the reference HEX are now verified on hardware (2026-11-03).** The MCP flash endpoints and ATfE firmware runtime remain unverified. The service is intentionally unauthenticated and unencrypted for the trusted local LAN, as requested. It can halt the target and optionally write flash; keep port 8766 on that LAN. There are **no GitHub Actions workflows** and nothing starts automatically after reboot.
 
 ## Repository role
 
-Suggested canonical GitHub repository: `civcode/rpi5-openocd-mcp-worker` (separate from `civcode/STM32F103-BU0x_SDK`). The STM32 `ATfE-port` project already contains the basic `tools/rpi5-debug` shell scripts and `docs/RPI5_OPENOCD_DEBUG.md`; the dedicated MCP worker adds remote orchestration and should link to those instructions rather than duplicating their logic in the firmware repository.
+Canonical GitHub repository: `civcode/rpi5-hardware-mcp-worker` (separate from `civcode/STM32F103-BU0x_SDK`). The STM32 `ATfE-port` project already contains the basic `tools/rpi5-debug` shell scripts and `docs/RPI5_OPENOCD_DEBUG.md`; the hardware MCP worker adds remote SWD and UART orchestration and should link to those instructions rather than duplicating their logic in the firmware repository.
 
 Reference documentation: https://openocd.org/doc/html/Server-Configuration.html , https://openocd.org/doc/html/Debug-Adapter-Configuration.html , https://github.com/raspberrypi/debugprobe/releases , https://py.sdk.modelcontextprotocol.io/run/ .

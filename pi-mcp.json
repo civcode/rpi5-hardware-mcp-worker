@@ -1,8 +1,8 @@
 {
   "mcpServers": {
-    "rpi5-openocd": {
-      "url": "http://rpi5:8766/mcp",
-      "description": "Raspberry Pi 5 USB CMSIS-DAP + STM32F103 OpenOCD worker"
+    "rpi5-hardware": {
+      "url": "http://edge.local:8766/mcp",
+      "description": "Raspberry Pi 5 OpenOCD and USB-UART/AT tools"
     }
   }
 }
