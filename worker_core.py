@@ -131,11 +131,21 @@ class OpenOCDWorker:
         self._port = 3333
         self._images: dict[str, dict] = {}
         self.flash_snapshots = FlashSnapshotStore()
+        self._closed = False
 
     def close(self) -> None:
-        self.stop_gdb_server()
-        if self._owns_workspace:
-            shutil.rmtree(self.workspace, ignore_errors=True)
+        """Stop owned GDB/OpenOCD, then release transient workspace once.
+
+        Safe to invoke both in the explicit server shutdown and at interpreter
+        exit. Persistent flash snapshots are deliberately retained.
+        """
+        with self._lock:
+            if self._closed:
+                return
+            self.stop_gdb_server()
+            if self._owns_workspace:
+                shutil.rmtree(self.workspace, ignore_errors=True)
+            self._closed = True
 
     def _args(self, speed_khz: int, quirk: bool = False) -> list[str]:
         validate_speed(speed_khz)
