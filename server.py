@@ -140,7 +140,7 @@ def serial_capture(port: str = "", baudrate: int = 115200,
 def serial_at_query(command: str, port: str = "", baudrate: int = 115200,
                     timeout_ms: int = 2500, max_bytes: int = 4096,
                     quiet_ms: int = 150) -> dict:
-    """Send a recognized read-only AT command; return byte-exact response and status."""
+    """Send allowlisted AT query, <=61 ASCII bytes + CRLF, paced at 5 ms per byte."""
     return serial_tool_result(serial_worker.serial_at_query, command, port, baudrate, timeout_ms, max_bytes, quiet_ms)
 
 
@@ -148,7 +148,7 @@ def serial_at_query(command: str, port: str = "", baudrate: int = 115200,
 def serial_at_command(command: str, confirm: str = "", port: str = "",
                       baudrate: int = 115200, timeout_ms: int = 2500,
                       max_bytes: int = 4096) -> dict:
-    """Opt-in state-changing AT command; require confirm='AT_WRITE'."""
+    """Opt-in AT command; <=61 ASCII bytes + CRLF, 5 ms byte pacing; confirm='AT_WRITE'."""
     return serial_tool_result(serial_worker.serial_at_command, command, confirm, port, baudrate, timeout_ms, max_bytes)
 
 
