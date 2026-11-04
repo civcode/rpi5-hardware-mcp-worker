@@ -33,13 +33,26 @@ class SnapshotError(ValueError):
     pass
 
 
+def snapshot_tool_result(operation, *args, **kwargs) -> dict:
+    """Report expected snapshot input/file errors as normal MCP tool results.
+
+    Keep unexpected programming errors visible; only handle the domain's
+    validation and filesystem errors here.
+    """
+    try:
+        return operation(*args, **kwargs)
+    except (SnapshotError, OSError) as exc:
+        return {"ok": False, "error": str(exc),
+                "error_type": type(exc).__name__}
+
+
 def _sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _check_id(value: str) -> str:
+def _check_id(value: str, name: str = "snapshot_id") -> str:
     if not isinstance(value, str) or not _ID.fullmatch(value):
-        raise SnapshotError("snapshot_id must be 32 lowercase hex characters")
+        raise SnapshotError(f"{name} must be 32 lowercase hex characters")
     return value
 
 
@@ -267,7 +280,7 @@ class FlashSnapshotStore:
                    offset: int = 0, length: int = 4096) -> dict:
         """Retrieve a bounded stored CSV or JSON diff report, with integrity hash."""
         import base64
-        _check_id(diff_id)
+        _check_id(diff_id, "diff_id")
         if format not in ("csv", "json"):
             raise SnapshotError("format must be csv or json")
         if type(offset) is not int or offset < 0:
