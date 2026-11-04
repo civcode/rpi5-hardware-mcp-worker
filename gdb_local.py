@@ -1,120 +1,213 @@
-"""Bounded GDB client running on the Pi beside the worker-managed OpenOCD.
+"""Persistent GDB/MI command transport for worker-managed OpenOCD.
 
-No remote network access is required from the MCP caller.  Only predefined
-GDB commands are used; no executable, command, or file path comes from MCP.
+Commands are forwarded verbatim to GDB's console interpreter, or as native
+MI commands when prefixed with '-'.  A secret operator token is required for
+each call because the GDB command language can modify the host and target.
 """
 from __future__ import annotations
 
-import base64
-import hashlib
+import ast
+import hmac
+import json
 import os
-from pathlib import Path
+import queue
 import re
 import shutil
 import subprocess
-import tempfile
+import threading
+import time
 
-MAX_MEMORY_BYTES = 4096
-MAX_GDB_OUTPUT = 18000
-FAULT_REGISTERS = {
-    "ICSR": 0xE000ED04,
-    "CCR": 0xE000ED14,
-    "SHCSR": 0xE000ED24,
-    "CFSR": 0xE000ED28,
-    "HFSR": 0xE000ED2C,
-    "DFSR": 0xE000ED30,
-    "MMFAR": 0xE000ED34,
-    "BFAR": 0xE000ED38,
-}
-CPU_REGISTER_RE = re.compile(
-    r"^\s*(r(?:1[0-5]|[0-9])|sp|lr|pc|xpsr|msp|psp|primask|basepri|faultmask|control)\s+"
-    r"(0x[0-9a-fA-F]+)\b", re.MULTILINE | re.IGNORECASE
-)
+MAX_GDB_OUTPUT = 20000
+MAX_QUEUED_LINES = 4096
+_RESULT_RE = re.compile(r"^(\d+)\^(done|running|connected|error|exit)(?:,|$)")
+_STREAM_RE = re.compile(r'^([~@&])("(?:\\.|[^"\\])*")$')
+_ERROR_RE = re.compile(r'(?:^|,)msg=("(?:\\.|[^"\\])*")')
+
+
+def _decode_mi_string(encoded: str) -> str:
+    """Unescape GDB's C-style quoted MI string without executing any code."""
+    try:
+        return ast.literal_eval(encoded)
+    except (ValueError, SyntaxError):
+        return encoded
 
 
 class LocalGDB:
+    """One long-lived GDB process, serialized commands, bounded responses."""
+
     def __init__(self, executable: str | None = None):
         self.executable = executable or os.getenv("RPI5_GDB", "gdb-multiarch")
+        self._lock = threading.RLock()
+        self._process: subprocess.Popen | None = None
+        self._lines: queue.Queue[str | None] = queue.Queue(maxsize=MAX_QUEUED_LINES)
+        self._token = 0
+        self._port: int | None = None
+        self._dropped = 0
 
-    def _batch(self, port: int, commands: list[str]) -> dict:
-        exe = shutil.which(self.executable)
-        if not exe:
-            return {"ok": False, "error": f"GDB executable not found: {self.executable}; install gdb-multiarch on edge"}
-        # --nx/--nh exclude local init scripts. 'disconnect' does not resume
-        # the target, unlike 'detach'. No host shell, user GDB command or ELF.
-        args = [exe, "--nx", "--nh", "--quiet", "--batch",
-                "-ex", "set confirm off", "-ex", "set pagination off",
-                "-ex", "set remotetimeout 5",
-                "-ex", f"target extended-remote 127.0.0.1:{port}"]
-        for cmd in commands:
-            args.extend(("-ex", cmd))
-        args.extend(("-ex", "disconnect"))
+    def running(self) -> bool:
+        with self._lock:
+            return self._process is not None and self._process.poll() is None
+
+    def close(self) -> None:
+        """Stop only the local GDB process; no implicit target action."""
+        with self._lock:
+            proc = self._process
+            self._process = None
+            self._port = None
+            if proc is not None:
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=3)
+                if proc.stdin:
+                    proc.stdin.close()
+                if proc.stdout:
+                    proc.stdout.close()
+            self._lines = queue.Queue(maxsize=MAX_QUEUED_LINES)
+            self._dropped = 0
+
+    def _read_output(self, proc: subprocess.Popen, lines: queue.Queue[str | None]) -> None:
         try:
-            result = subprocess.run(args, capture_output=True, text=True,
-                                    errors="replace", timeout=30, check=False,
-                                    stdin=subprocess.DEVNULL)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            return {"ok": False, "error": str(exc)}
-        output = (result.stdout + result.stderr)[-MAX_GDB_OUTPUT:]
-        return {"ok": result.returncode == 0, "exit_code": result.returncode,
-                "output": output}
-
-    def inspect(self, port: int) -> dict:
-        """Halt and read core registers, fault status, and nearby instructions."""
-        commands = ["monitor halt", "info registers", "x/12i $pc"]
-        commands.extend(f"x/1wx 0x{address:08x}" for address in FAULT_REGISTERS.values())
-        result = self._batch(port, commands)
-        if not result.get("ok"):
-            return result
-        output = result["output"]
-        registers = {name.lower(): value.lower() for name, value in CPU_REGISTER_RE.findall(output)}
-        system = {}
-        for name, address in FAULT_REGISTERS.items():
-            match = re.search(rf"(?:0x)?{address:08x}\s*:\s*(0x[0-9a-fA-F]+)", output, re.I)
-            if match:
-                system[name] = match.group(1).lower()
-        result.update({"registers": registers, "system_registers": system,
-                       "target_state": "halted", "resumed": False})
-        if "pc" not in registers:
-            result.update({"ok": False, "error": "GDB did not return a numeric PC register"})
-        return result
-
-    def read_memory(self, port: int, workspace: Path, address: int, length: int) -> dict:
-        """Read a bounded target-memory range; file stays local and is deleted."""
-        if type(address) is not int or not 0 <= address <= 0xFFFFFFFF:
-            raise ValueError("address must be a 32-bit unsigned integer")
-        if type(length) is not int or not 1 <= length <= MAX_MEMORY_BYTES:
-            raise ValueError(f"length must be 1..{MAX_MEMORY_BYTES} bytes")
-        if address + length > 0x100000000:
-            raise ValueError("memory range wraps past 32-bit address space")
-        with tempfile.TemporaryDirectory(prefix="gdb-read-", dir=workspace) as directory:
-            output_path = Path(directory) / "target.bin"
-            result = self._batch(port, ["monitor halt", f"dump binary memory {output_path} "
-                                        f"0x{address:08x} 0x{address + length:08x}"])
-            if not result.get("ok"):
-                return result
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                item = line.rstrip("\r\n")
+                try:
+                    lines.put_nowait(item)
+                except queue.Full:
+                    try:
+                        lines.get_nowait()
+                    except queue.Empty:
+                        pass
+                    self._dropped += 1
+                    try:
+                        lines.put_nowait(item)
+                    except queue.Full:
+                        self._dropped += 1
+        finally:
             try:
-                data = output_path.read_bytes()
-            except OSError as exc:
-                return {"ok": False, "error": f"GDB memory dump missing: {exc}", "output": result.get("output", "")}
-            if len(data) != length:
-                return {"ok": False, "error": f"GDB produced {len(data)} instead of {length} bytes"}
-            return {"ok": True, "address": f"0x{address:08x}", "length": len(data),
-                    "sha256": hashlib.sha256(data).hexdigest(),
-                    "data_base64": base64.b64encode(data).decode("ascii"),
-                    "data_hex": data.hex() if length <= 256 else None,
-                    "target_state": "halted", "resumed": False}
+                lines.put_nowait(None)
+            except queue.Full:
+                pass
 
-    def control(self, port: int, action: str) -> dict:
-        """Explicit MCU action. No reset, flash, or resume during inspection."""
-        actions = {
-            "halt": "monitor halt",
-            "resume": "monitor resume",
-            "reset_halt": "monitor reset halt",
+    def _send(self, mi_command: str, timeout: float) -> dict:
+        proc = self._process
+        assert proc is not None and proc.stdin is not None
+        self._token += 1
+        token = self._token
+        try:
+            proc.stdin.write(f"{token}{mi_command}\n")
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError) as exc:
+            return {"ok": False, "error": f"GDB input failed: {exc}", "session_lost": True}
+
+        deadline = time.monotonic() + timeout
+        raw: list[str] = []
+        visible: list[str] = []
+        result_class = None
+        result_record = ""
+        while time.monotonic() < deadline:
+            try:
+                line = self._lines.get(timeout=max(0.001, deadline - time.monotonic()))
+            except queue.Empty:
+                break
+            if line is None:
+                return {"ok": False, "error": "GDB process closed its output", "session_lost": True,
+                        "output": "".join(visible)[-MAX_GDB_OUTPUT:]}
+            raw.append(line)
+            stream = _STREAM_RE.match(line)
+            if stream:
+                visible.append(_decode_mi_string(stream.group(2)))
+            elif line.startswith(("*", "=", "+")):
+                visible.append(line + "\n")
+            result = _RESULT_RE.match(line)
+            if result and int(result.group(1)) == token:
+                result_class = result.group(2)
+                result_record = line
+                break
+
+        raw_text = "\n".join(raw)
+        output = "".join(visible)
+        response = {
+            "ok": result_class in ("done", "connected", "running"),
+            "result_class": result_class,
+            "output": output[-MAX_GDB_OUTPUT:],
+            "raw_mi": raw_text[-MAX_GDB_OUTPUT:],
+            "truncated": len(output) > MAX_GDB_OUTPUT or len(raw_text) > MAX_GDB_OUTPUT,
+            "dropped_lines": self._dropped,
         }
-        if action not in actions:
-            raise ValueError("action must be halt, resume, or reset_halt")
-        result = self._batch(port, [actions[action]])
-        result["action"] = action
-        result["expected_target_state"] = "running" if action == "resume" else "halted"
-        return result
+        if result_class is None:
+            response.update({"error": f"GDB did not complete within {timeout:g}s", "session_lost": True,
+                             "target_state": "unknown"})
+        elif result_class == "error":
+            match = _ERROR_RE.search(result_record)
+            response["error"] = _decode_mi_string(match.group(1)) if match else result_record
+        elif result_class == "exit":
+            response.update({"ok": False, "session_lost": True, "error": "GDB exited"})
+        return response
+
+    def _start(self, port: int) -> dict:
+        executable = shutil.which(self.executable)
+        if not executable:
+            return {"ok": False, "error": f"GDB executable not found: {self.executable}; install gdb-multiarch on edge"}
+        try:
+            proc = subprocess.Popen(
+                [executable, "--nx", "--nh", "--quiet", "--interpreter=mi2"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace", bufsize=1,
+            )
+        except OSError as exc:
+            return {"ok": False, "error": f"Cannot start GDB: {exc}"}
+        self._process = proc
+        self._port = port
+        lines = self._lines
+        threading.Thread(target=self._read_output, args=(proc, lines), daemon=True).start()
+        for command in ("-gdb-set pagination off", "-gdb-set confirm off",
+                        "-gdb-set mi-async on", f"-target-select extended-remote 127.0.0.1:{port}"):
+            result = self._send(command, 15)
+            if not result["ok"]:
+                self.close()
+                return {"ok": False, "error": f"Cannot initialize GDB with {command}: {result.get('error', result.get('raw_mi'))}"}
+        return {"ok": True}
+
+    def command(self, command: str, port: int, auth_token: str, timeout_seconds: int = 30) -> dict:
+        """Forward one full GDB CLI or native MI command; empty string polls output."""
+        secret = os.getenv("RPI5_GDB_COMMAND_TOKEN", "")
+        if len(secret) < 32:
+            return {"ok": False, "error": "GDB command forwarding disabled: set RPI5_GDB_COMMAND_TOKEN to a random 32+ character secret"}
+        if type(auth_token) is not str or not hmac.compare_digest(auth_token, secret):
+            return {"ok": False, "error": "Invalid GDB authorization token"}
+        if type(command) is not str:
+            raise ValueError("command must be a string")
+        if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 300:
+            raise ValueError("timeout_seconds must be an integer from 1 to 300")
+        with self._lock:
+            if command == "":
+                raw = []
+                while True:
+                    try:
+                        line = self._lines.get_nowait()
+                    except queue.Empty:
+                        break
+                    if line is not None:
+                        raw.append(line)
+                payload = "\n".join(raw)
+                return {"ok": self.running(), "output": payload[-MAX_GDB_OUTPUT:],
+                        "truncated": len(payload) > MAX_GDB_OUTPUT, "dropped_lines": self._dropped,
+                        "gdb_running": self.running()}
+            if self._process is None or self._process.poll() is not None or self._port != port:
+                self.close()
+                started = self._start(port)
+                if not started["ok"]:
+                    return started
+            mi_command = command if command.startswith("-") else "-interpreter-exec console " + json.dumps(command, ensure_ascii=False)
+            if command.startswith("-") and "\n" in command:
+                return {"ok": False, "error": "Native MI protocol requests must occupy one line"}
+            result = self._send(mi_command, timeout_seconds)
+            result["command"] = command
+            result["gdb_pid"] = self._process.pid if self._process else None
+            if result.get("session_lost"):
+                self.close()
+            return result

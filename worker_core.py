@@ -20,6 +20,7 @@ import time
 import uuid
 
 from flash_snapshots import FlashSnapshotStore
+from gdb_local import LocalGDB
 
 
 FLASH_START = 0x08000000
@@ -131,6 +132,7 @@ class OpenOCDWorker:
         self._port = 3333
         self._images: dict[str, dict] = {}
         self.flash_snapshots = FlashSnapshotStore()
+        self._gdb_client = LocalGDB()
         self._closed = False
 
     def close(self) -> None:
@@ -284,6 +286,14 @@ class OpenOCDWorker:
                     "mdw 0xE000ED34 1", "mdw 0xE000ED38 1", "shutdown"]
         return self._one_shot(speed_khz, commands, timeout=30, quirk=quirk)
 
+    def gdb_command(self, command: str, auth_token: str, timeout_seconds: int = 30) -> dict:
+        """Send a command to the owned, persistent local GDB process."""
+        with self._lock:
+            if not self._server_running():
+                self._gdb_client.close()
+                return {"ok": False, "error": "OpenOCD server unavailable; start_gdb_server is required"}
+            return self._gdb_client.command(command, self._port, auth_token, timeout_seconds)
+
     def start_gdb_server(self, speed_khz: int = 100, port: int = 3333, quirk: bool = False) -> dict:
         validate_speed(speed_khz)
         if type(port) is not int or not 1024 <= port <= 65535:
@@ -291,6 +301,7 @@ class OpenOCDWorker:
         with self._lock:
             if self._server_running():
                 return {"ok": True, "already_running": True, **self.server_status()}
+            self._gdb_client.close()
             self._port = port
             log_path = self.workspace / "openocd-gdb.log"
             self._log_handle = log_path.open("ab")
@@ -330,11 +341,13 @@ class OpenOCDWorker:
                 with log_path.open("rb") as f:
                     f.seek(max(0, log_path.stat().st_size - MAX_LOG_CHARS))
                     tail = f.read().decode("utf-8", errors="replace")
-            return {"running": running, "gdb_port": self._port, "gdb_host": socket.gethostname(),
+            return {"running": running, "local_gdb_running": self._gdb_client.running(),
+                    "gdb_port": self._port, "gdb_host": socket.gethostname(),
                     "pid": self._process.pid if self._process else None, "recent_log": tail[-5000:]}
 
     def stop_gdb_server(self) -> dict:
         with self._lock:
+            self._gdb_client.close()
             proc = self._process
             if proc is None:
                 return {"ok": True, "stopped": False}

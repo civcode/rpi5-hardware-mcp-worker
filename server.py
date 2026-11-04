@@ -95,6 +95,12 @@ def start_gdb_server(speed_khz: int = 100, port: int = 3333, quirk: bool = False
 
 
 @mcp.tool()
+def gdb_command(command: str, auth_token: str, timeout_seconds: int = 30) -> dict:
+    """Execute a GDB console or MI command in the authenticated local session."""
+    return worker.gdb_command(command, auth_token, timeout_seconds)
+
+
+@mcp.tool()
 def gdb_server_status() -> dict:
     """Check current OpenOCD GDB server state and return recent log lines."""
     return worker.server_status()
