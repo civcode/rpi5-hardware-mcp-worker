@@ -257,16 +257,14 @@ class SerialWorker:
         return self._result(rx, chosen, baudrate, transmitted=True,
                             tx_bytes=written, truncated=truncated)
 
-    def serial_at_command(self, command: str, confirm: str = "", port: str = "",
+    def serial_at_command(self, command: str, port: str = "",
                           baudrate: int = 115200, timeout_ms: int = 2500,
                           max_bytes: int = MAX_RX) -> dict:
-        """Confirmed AT setter/save, independent of raw-write service setting.
+        """Send an AT setter/save without a redundant confirmation argument.
 
         Still enforces printable ASCII, 61-character text limit, CRLF framing,
-        5 ms pacing, and per-call confirm='AT_WRITE'.
+        and 5 ms inter-byte pacing. Raw UART exchange remains separately gated.
         """
-        if confirm != "AT_WRITE":
-            raise SerialError("AT configuration command requires confirm='AT_WRITE'")
         tx = self._at_frame(command)
         chosen = self._device(port)
         _integer(timeout_ms, "timeout_ms", 100, 10000)
