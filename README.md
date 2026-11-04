@@ -33,6 +33,16 @@ Diffs return changed pages/ranges and write exhaustive JSON and CSV with
 per-byte old/new values and candidate little-endian numeric interpretations.
 The chunk APIs retrieve saved binaries/reports over MCP without requiring SSH.
 
+Both guarded AT endpoints (`serial_at_query` and `serial_at_command`)
+reject commands over **61 printable ASCII bytes**, because they append CRLF and
+the historical STM32 receive buffer wraps at a 64-byte frame. Commands are
+transmitted **one byte at a time**, with a 5 ms inter-byte pause and a
+transmitter flush after each byte, matching the historical host workaround.
+These are conservative 2024-source constraints, not a measurement of the
+binary-only 2026 firmware. The generic `serial_exchange` raw endpoint does
+**not** apply these AT protections and must not be used for AT configuration
+experiments.
+
 For a controlled one-setting-at-a-time stock firmware experiment, see
 **[FLASH_SNAPSHOT_EXPERIMENT.md](FLASH_SNAPSHOT_EXPERIMENT.md)**. Sending
 `AT+SAVE` is a separate operation that **does** write flash and reset; it
