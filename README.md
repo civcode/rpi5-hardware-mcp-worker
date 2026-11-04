@@ -17,6 +17,33 @@ Oberon (Linux)
 
 MCP controls SWD and UART; native remote GDB is the interactive debugging plane. **One OpenOCD process owns the physical probe at a time.** If the GDB server is active, standalone `probe_target`, `fault_snapshot` and `flash_hex` refuse to start another connection; use `monitor` in GDB or stop the GDB server first.
 
+## Flash snapshots and stock V1.0.1 configuration mapping
+
+The `flash_snapshot` MCP tool temporarily halts the STM32, reads its **entire
+detected 64- or 128-KiB main flash** through OpenOCD, explicitly attempts to
+resume it, and stores a SHA-256-verified binary under
+`~/rpi5-flash-snapshots` (customize with `RPI5_FLASH_SNAPSHOT_DIR`).
+It does **not** reset, erase or program the MCU. Installed OpenOCD target
+scripts may nevertheless alter debug-related registers during attach.
+
+`flash_snapshot_list`, `flash_snapshot_info`,
+`flash_snapshot_chunk`, `flash_snapshot_diff`, and
+`flash_snapshot_diff_chunk` operate **entirely on host-side stored files**.
+Diffs return changed pages/ranges and write exhaustive JSON and CSV with
+per-byte old/new values and candidate little-endian numeric interpretations.
+The chunk APIs retrieve saved binaries/reports over MCP without requiring SSH.
+
+For a controlled one-setting-at-a-time stock firmware experiment, see
+**[FLASH_SNAPSHOT_EXPERIMENT.md](FLASH_SNAPSHOT_EXPERIMENT.md)**. Sending
+`AT+SAVE` is a separate operation that **does** write flash and reset; it
+is never initiated by the snapshot/diff tools.
+
+Existing binary backups can also be compared **without any hardware**:
+
+```bash
+python3 flash_snapshots.py before.bin after.bin --csv changes.csv --json changes.json
+```
+
 ## Install on Raspberry Pi 5 (headless Raspberry Pi OS)
 
 ```bash
