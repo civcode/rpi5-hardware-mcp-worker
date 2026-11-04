@@ -57,6 +57,24 @@ The tool produces a 128-KiB image (if the target reports 128 KiB), or a
 option bytes or DW3000 OTP, and the SDK's presumed configuration sector 78
 is **not** hard-coded as the only region checked.
 
+## Snapshot and diff identifiers
+
+All ID-based APIs require the **exact, returned** 32-character lowercase hex
+identifier, not a label, path, SHA-256 or example placeholder.
+
+- First call `flash_snapshot_list()` to see whether a valid capture exists.
+- If the list is empty, call `flash_snapshot(...)` and inspect `ok`,
+  `snapshot_id`, `flash_kib`, `sha256`, and `resumed`.
+- Pass that returned `snapshot_id` to `flash_snapshot_info`,
+  `flash_snapshot_chunk`, or `flash_snapshot_diff`.
+- A successful `flash_snapshot_diff` returns a **different** `diff_id`.
+  Use that `diff_id` only for `flash_snapshot_diff_chunk`.
+- Never substitute the display labels `stock-baseline` or
+  `<baseline ID>` as tool arguments.
+- On expected validation errors, the MCP tool returns `ok: false` with an
+  `error` field. Do not perform configuration changes until valid baseline
+  and control snapshots have been verified.
+
 ## Suggested experiment sequence
 
 **Preparation (no device writes)**
