@@ -2,7 +2,7 @@
 import base64
 import unittest
 
-from serial_core import SerialWorker, SerialError, _allowed_ports
+from serial_core import SerialWorker, SerialError, _allowed_ports, serial_tool_result
 
 
 class FakeSerial:
@@ -181,6 +181,23 @@ class SerialCoreTests(unittest.TestCase):
         with self.assertRaises(SerialError):
             worker.serial_capture(baudrate=True)
         self.assertEqual(instances, [])
+
+    def test_mcp_error_result_preserves_expected_error_without_claiming_no_transmission(self):
+        worker, instances = self.make_worker()
+        result = serial_tool_result(worker.serial_at_query, "AT+SAVE")
+        self.assertFalse(result["ok"])
+        self.assertIn("allowlist", result["error"])
+        self.assertEqual(result["error_type"], "SerialError")
+        self.assertNotIn("transmitted", result)
+        self.assertEqual(instances, [])
+
+        def busy():
+            raise OSError(16, "Device or resource busy")
+
+        result = serial_tool_result(busy)
+        self.assertFalse(result["ok"])
+        self.assertIn("busy", result["error"])
+        self.assertNotIn("transmitted", result)
 
     def test_list_exposes_only_configured(self):
         worker, _ = self.make_worker()

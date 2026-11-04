@@ -25,6 +25,18 @@ class SerialError(ValueError):
     pass
 
 
+def serial_tool_result(operation: Callable, *args) -> dict:
+    """Expose expected UART failures to MCP clients instead of generic errors.
+
+    Transmission status is deliberately omitted on failure: an I/O error can
+    occur after some bytes have already reached the device.
+    """
+    try:
+        return operation(*args)
+    except (SerialError, OSError) as exc:
+        return {"ok": False, "error": str(exc), "error_type": type(exc).__name__}
+
+
 def _integer(value: int, name: str, low: int, high: int) -> int:
     if type(value) is not int or not low <= value <= high:
         raise SerialError(f"{name} must be an integer between {low} and {high}")
