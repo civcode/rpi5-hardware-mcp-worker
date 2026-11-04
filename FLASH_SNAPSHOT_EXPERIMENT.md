@@ -75,6 +75,37 @@ identifier, not a label, path, SHA-256 or example placeholder.
   `error` field. Do not perform configuration changes until valid baseline
   and control snapshots have been verified.
 
+## AT command length and pacing (important)
+
+The original 2024 firmware's USART1 command buffer holds 64 bytes but wraps
+when byte 64 arrives. The MCP worker therefore enforces a conservative limit
+of **61 printable ASCII command bytes**, excluding the appended **CRLF**.
+The transmitted frame can be **at most 63 bytes including CRLF**.
+
+Both `serial_at_query` and `serial_at_command` enforce this limit before
+opening the serial device. Both send **one byte at a time**, with a 5 ms
+inter-byte delay and a transmit flush for each byte, matching the successful
+workaround in `ai-thinker-bu03-bu04-uwb-kit`. The 5 ms gap is conservative,
+not a measured minimum of the 2026 stock firmware.
+
+For this configuration mapping experiment:
+
+- Use only these guarded AT tools for transmitted AT commands.
+- Do **not** use `serial_exchange` for AT commands: it is a general raw
+  transmit endpoint and bypasses the AT-specific frame-length/pacing guards.
+- Never split an AT command across several UART tool calls to bypass length
+  checks.
+- Do not send a second command until the first response has ended or timed
+  out; ensure the module has booted after any approved `AT+SAVE` reset.
+- If a desired setter exceeds 61 command bytes, **do not send it**.
+  Report its full length and propose a shorter documented numeric
+  representation while retaining the same numerical values.
+- A command length that is safe under the 2024 source is not proof of an
+  identical RX limit in the 2026 binary; keep pacing and monitor responses.
+
+The snapshot and diff tools use SWD and saved host files, not the UART
+receiver, so their payload sizes are unrelated to the 64-byte AT buffer.
+
 ## Suggested experiment sequence
 
 **Preparation (no device writes)**
