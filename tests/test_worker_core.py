@@ -34,6 +34,16 @@ class WorkerTests(unittest.TestCase):
         self.worker.close()
         self.tmp.cleanup()
 
+    def test_close_is_idempotent_and_releases_owned_gdb_once(self):
+        # The explicit server finally block and the atexit fallback both
+        # call close(); the worker must not terminate OpenOCD twice.
+        with patch.object(self.worker, "stop_gdb_server",
+                          return_value={"ok": True, "stopped": False}) as stop:
+            self.worker.close()
+            self.worker.close()
+        stop.assert_called_once_with()
+        self.assertTrue(self.worker._closed)
+
     def test_speed_limits(self):
         self.assertEqual(validate_speed(100), 100)
         for n in (0, 9, 5001, '100', True):
