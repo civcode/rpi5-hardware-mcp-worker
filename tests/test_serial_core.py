@@ -155,22 +155,35 @@ class SerialCoreTests(unittest.TestCase):
         self.assertTrue(result["transmitted"])
         self.assertEqual(enabled_instances[0].writes, [b"AT+RESTORE\r\n"])
 
-    def test_at_command_requires_opt_in_and_confirmation(self):
+    def test_at_command_requires_confirmation_but_no_service_switch(self):
+        # The previously blocked stock configuration setter must work with
+        # allow_writes=False (the worker's standard startup configuration).
         worker, instances = self.make_worker()
-        with self.assertRaises(SerialError):
-            worker.serial_at_command("AT+RESTORE", "AT_WRITE")
+        with self.assertRaisesRegex(SerialError, "AT_WRITE"):
+            worker.serial_at_command("AT+PDOAOFF=37")
         self.assertEqual(instances, [])
-        enabled, open_instances = self.make_worker(allow_writes=True)
-        with self.assertRaises(SerialError):
-            enabled.serial_at_command("AT+RESTORE")
         for malformed in ("AT\rAT+RESTORE", "AT\n", "at+SAVE", "AT\x00", "XAT", "AT" + "a" * 160):
             with self.assertRaises(SerialError):
-                enabled.serial_at_command(malformed, "AT_WRITE")
-        self.assertEqual(open_instances, [])
-        result = enabled.serial_at_command("AT+RESTORE", "AT_WRITE", timeout_ms=100)
+                worker.serial_at_command(malformed, "AT_WRITE")
+        self.assertEqual(instances, [])
+
+        result = worker.serial_at_command("AT+PDOAOFF=37", "AT_WRITE", timeout_ms=100)
         self.assertEqual(result["status"], "OK")
-        self.assertEqual(b"".join(open_instances[0].writes), b"AT+RESTORE\r\n")
-        self.assertTrue(all(len(chunk) == 1 for chunk in open_instances[0].writes))
+        self.assertEqual(b"".join(instances[0].writes), b"AT+PDOAOFF=37\r\n")
+        self.assertTrue(all(len(chunk) == 1 for chunk in instances[0].writes))
+
+        # AT+SAVE also works with the default worker configuration; the
+        # test uses only a fake UART and never actually writes flash.
+        saved = worker.serial_at_command("AT+SAVE", "AT_WRITE", timeout_ms=100)
+        self.assertEqual(saved["status"], "OK")
+        self.assertEqual(b"".join(instances[1].writes), b"AT+SAVE\r\n")
+
+    def test_raw_exchange_remains_service_gated(self):
+        worker, instances = self.make_worker()
+        payload = base64.b64encode(b"AT+SAVE\r\n").decode("ascii")
+        with self.assertRaisesRegex(SerialError, "disabled"):
+            worker.serial_exchange(payload, confirm="SEND")
+        self.assertEqual(instances, [])
 
     def test_at_frame_length_boundary_before_open(self):
         worker, instances = self.make_worker(allow_writes=True)
