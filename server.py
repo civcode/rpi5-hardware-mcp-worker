@@ -19,10 +19,10 @@ mcp = MCPServer(
     "rpi5-hardware",
     instructions=("USB CMSIS-DAP/OpenOCD and UART/AT tools for STM32F103 BU03/BU04. "
                   "SWD probes halt the MCU; flashing requires explicit SHA-256 confirmation. "
-                  "AT queries use a read-only command allowlist. Confirmed AT setters "
-                  "and SAVE require confirm='AT_WRITE' but no startup unlock. "
-                  "Unrestricted raw UART still requires RPI5_SERIAL_ENABLE_WRITES=1 "
-                  "and confirm='SEND'."),
+                  "AT queries use a read-only command allowlist. AT setters and "
+                  "SAVE use validated, length-bounded, byte-paced UART without an unlock "
+                  "or confirmation argument. Unrestricted raw UART still requires "
+                  "RPI5_SERIAL_ENABLE_WRITES=1 and confirm='SEND'."),
 )
 
 
@@ -147,11 +147,11 @@ def serial_at_query(command: str, port: str = "", baudrate: int = 115200,
 
 
 @mcp.tool()
-def serial_at_command(command: str, confirm: str = "", port: str = "",
+def serial_at_command(command: str, port: str = "",
                       baudrate: int = 115200, timeout_ms: int = 2500,
                       max_bytes: int = 4096) -> dict:
-    """AT setter/save with confirm='AT_WRITE'; <=61 ASCII bytes + CRLF, paced 5 ms/byte; no startup unlock."""
-    return serial_tool_result(serial_worker.serial_at_command, command, confirm, port, baudrate, timeout_ms, max_bytes)
+    """Send AT setter/save directly; <=61 ASCII bytes + CRLF, paced 5 ms/byte."""
+    return serial_tool_result(serial_worker.serial_at_command, command, port, baudrate, timeout_ms, max_bytes)
 
 
 @mcp.tool()
