@@ -8,7 +8,7 @@ import re
 import tempfile
 import unittest
 from unittest.mock import patch
-from flash_snapshots import FlashSnapshotStore, SnapshotError, analyze_difference
+from flash_snapshots import FlashSnapshotStore, SnapshotError, analyze_difference, snapshot_tool_result
 
 
 class Completed:
@@ -90,6 +90,25 @@ class SnapshotTests(unittest.TestCase):
     def test_label_validation(self):
         with self.assertRaises(SnapshotError):
             self.store.capture(["openocd"], self.work, "unsafe\nlabel")
+
+    def test_invalid_snapshot_id_yields_clean_mcp_error(self):
+        result = snapshot_tool_result(self.store.info, "<baseline ID>")
+        self.assertEqual(result["ok"], False)
+        self.assertEqual(result["error_type"], "SnapshotError")
+        self.assertIn("32 lowercase hex", result["error"])
+        self.assertEqual(snapshot_tool_result(self.store.chunk, "<baseline ID>")["ok"], False)
+        self.assertEqual(snapshot_tool_result(self.store.diff, "<baseline ID>", "<control ID>")["ok"], False)
+
+    def test_invalid_diff_id_has_precise_error(self):
+        result = snapshot_tool_result(self.store.diff_chunk, "<diff ID>")
+        self.assertFalse(result["ok"])
+        self.assertIn("diff_id", result["error"])
+
+    def test_unexpected_error_is_not_swallowed(self):
+        def broken():
+            raise RuntimeError("unexpected bug")
+        with self.assertRaises(RuntimeError):
+            snapshot_tool_result(broken)
 
     def test_ids_reject_path_traversal(self):
         with self.assertRaises(SnapshotError):
