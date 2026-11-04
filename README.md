@@ -84,7 +84,7 @@ The UART tools use the existing plain-HTTP endpoint `http://edge.local:8766/mcp`
 - The port is opened with POSIX exclusive access. Close Minicom and other serial processes first. The worker requests deasserted DTR/RTS before opening, but some USB UART drivers may generate transient line changes during open; whether this affects the target depends on wiring.
 - The [ai-thinker-bu03-bu04-uwb-kit](https://github.com/civcode/ai-thinker-bu03-bu04-uwb-kit) CLI remains available for high-level configuration/JSON export. The new tools provide lower-level serial/AT access, not full CLI feature parity.
 
-UART tools have offline unit tests using a fake serial port. **They have not yet been validated against a connected BU03/BU04**, and introducing them does not itself authorize a target operation.
+UART tools have offline unit tests using a fake serial port. A connected BU03/BU04 reporting V1.0.1 was also tested over `/dev/ttyUSB0`: passive capture returned no bytes, and three trials each of `AT`, `AT+GETVER`, `AT+GETCFG`, `AT+GETDEV`, `AT+PDOAGETCFG`, `AT+GETDLIST`, and `AT+GETKLIST` returned byte-identical responses ending in `OK`. Hex, Base64 and GB18030 views agreed with the received bytes; responses included control characters. This does not establish framing under delayed output, error responses, port contention or other firmware versions, and does not authorize target operations.
 
 ## Verified hardware and remote-debugging results (2026-11-03)
 
@@ -186,7 +186,7 @@ python3 -m unittest discover -s tests -v
 python3 -m py_compile server.py worker_core.py serial_core.py
 ```
 
-Unit tests mock OpenOCD. **Live Pi 5 USB/SWD access, MCP diagnostics/probe/GDB-server control, remote GDB, and direct OpenOCD programming plus verification of the reference HEX are now verified on hardware (2026-11-03).** The MCP flash endpoints and ATfE firmware runtime remain unverified. The service is intentionally unauthenticated and unencrypted for the trusted local LAN, as requested. It can halt the target and optionally write flash; keep port 8766 on that LAN. There are **no GitHub Actions workflows** and nothing starts automatically after reboot.
+Unit tests mock OpenOCD. **Live Pi 5 USB/SWD access, MCP diagnostics/probe/GDB-server control, remote GDB, and direct OpenOCD programming plus verification of the reference HEX are now verified on hardware (2026-11-03).** The MCP flash endpoints and ATfE firmware runtime remain unverified. UART query testing above used the running MCP service; its exact deployed commit was not independently verified. Minicom conflict handling and worker restart remain untested. The service is intentionally unauthenticated and unencrypted for the trusted local LAN, as requested. It can halt the target and optionally write flash; keep port 8766 on that LAN. There are **no GitHub Actions workflows** and nothing starts automatically after reboot.
 
 ## Repository role
 
