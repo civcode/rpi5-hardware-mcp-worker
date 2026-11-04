@@ -102,7 +102,7 @@ The Raspberry Pi 5 is named `edge`; use its LAN/mDNS hostname `edge.local`, or i
 | `serial_list_ports` | List configured USB serial devices and presence |
 | `serial_capture` | Bounded UART receive without transmission |
 | `serial_at_query` | Bounded read-only AT query, complete response and raw bytes |
-| `serial_at_command` | Confirmed AT configuration commands and `AT+SAVE`; **no service-wide write switch**; `confirm="AT_WRITE"` required |
+| `serial_at_command` | AT setters and `AT+SAVE`, no startup unlock or confirmation argument; AT length and pacing guards remain |
 | `serial_exchange` | Raw Base64 UART transmit, still disabled unless `RPI5_SERIAL_ENABLE_WRITES=1` and `confirm="SEND"` |
 
 `staged_hex_info(artifact_id)` reports the generated path only while the worker and staged artifact exist, after rechecking the file hash; it accepts no user path. A worker restart may invalidate the ID and delete its temporary files. The path is not authorization to program; any future GDB/OpenOCD programming commands require separate review and explicit approval.
@@ -122,7 +122,7 @@ The UART tools use the existing plain-HTTP endpoint `http://edge.local:8766/mcp`
 - Default UART: **115200 baud, 8N1**, no software or hardware flow control. Calls use finite timeouts, at most **4096 received bytes** and at most **256 transmitted bytes**.
 - `serial_list_ports()` reports presence and USB identifiers. `serial_capture(duration_ms=1000)` listens for unsolicited traffic without transmitting bytes.
 - `serial_at_query(command="AT+GETVER")` transmits `AT+GETVER\r\n` and returns `rx_base64`, `rx_hex`, `rx_gb18030`, `status` (`OK`, `ERROR`, or `INCOMPLETE`) and `complete`. Read-only allowlist: `AT`, `AT+GETVER`, `AT+GETCFG`, `AT+GETDEV`, `AT+GETUWBMODE`, `AT+PDOAGETCFG`, `AT+GETDLIST`, `AT+GETKLIST`. The quiet-window check refuses to transmit when unsolicited bytes are already present; use `serial_capture` to diagnose chatty firmware.
-- **AT setters and `AT+SAVE` need no startup unlock.** Run `./start.sh` normally and use `serial_at_command(command="AT+PDOAOFF=37", confirm="AT_WRITE")`, or another authorized short AT command. The command length (61 printable ASCII bytes plus CRLF) and 5 ms byte pacing remain enforced. The per-call confirmation is an *operation guard*, not network authentication.
+- **AT setters and `AT+SAVE` need no startup unlock or confirmation string.** Run `./start.sh` normally and use `serial_at_command(command="AT+PDOAOFF=37")`, or another short AT command. The command length (61 printable ASCII bytes plus CRLF), single-line validation, and 5 ms byte pacing remain enforced. Commands can modify settings or flash; use this tool only for intentional operations.
 - **Raw UART exchange is separate and remains disabled by default.** Only if a raw-byte workflow is explicitly needed, start with `RPI5_SERIAL_ENABLE_WRITES=1 ./start.sh` and use `serial_exchange(tx_base64="...", confirm="SEND")`. The stock layout-analysis task should never need this endpoint.
 - Raw Base64 and hex outputs preserve the exact received bytes; GB18030 text is display-only and may contain replacement characters. This is important for vendor AT responses containing control bytes.
 - After detecting a terminal line, queries continue collecting bytes until 100 ms of UART silence or the overall timeout/byte limit, so a split CR/LF is not normally left behind. The terminal marker and bounded quiet period do not prove that delayed unsolicited output or a premature `OK` belongs to the response; inspect the raw bytes when framing is uncertain.
