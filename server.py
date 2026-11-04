@@ -8,6 +8,7 @@ from mcp.server import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from worker_core import OpenOCDWorker
 from flash_snapshots import snapshot_tool_result
+from worker_lifecycle import run_with_cleanup
 from serial_core import SerialWorker, serial_tool_result
 
 worker = OpenOCDWorker()
@@ -160,9 +161,14 @@ def serial_exchange(tx_base64: str, confirm: str = "", port: str = "",
 
 
 if __name__ == "__main__":
-    mcp.run(
-        transport="streamable-http", host=os.getenv("RPI5_MCP_HOST", "0.0.0.0"),
-        port=int(os.getenv("RPI5_MCP_PORT", "8766")),
-        stateless_http=True, json_response=True,
-        transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+    # Leave signal handling to Uvicorn. It drains the HTTP server on Ctrl+C;
+    # then release worker-managed OpenOCD/resources explicitly before exit.
+    run_with_cleanup(
+        lambda: mcp.run(
+            transport="streamable-http", host=os.getenv("RPI5_MCP_HOST", "0.0.0.0"),
+            port=int(os.getenv("RPI5_MCP_PORT", "8766")),
+            stateless_http=True, json_response=True,
+            transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+        ),
+        worker.close,
     )
