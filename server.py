@@ -66,6 +66,13 @@ def flash_snapshot_diff(before_id: str, after_id: str, label: str = "") -> dict:
 
 
 @mcp.tool()
+def flash_snapshot_diff_chunk(diff_id: str, format: str = "csv",
+                              offset: int = 0, length: int = 4096) -> dict:
+    """Fetch 1-8192 bytes of saved JSON/CSV diff over MCP, no target access."""
+    return worker.flash_snapshot_diff_chunk(diff_id, format, offset, length)
+
+
+@mcp.tool()
 def probe_target(speed_khz: int = 100, quirk: bool = False) -> dict:
     """Connect via USB CMSIS-DAP SWD, HALT STM32, inspect ID and actual flash size; do not program."""
     return worker.probe_target(speed_khz, quirk)
