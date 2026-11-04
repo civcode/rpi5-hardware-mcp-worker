@@ -60,6 +60,28 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(parse_flash_kib('0x1ffff7e0: 0040'), 64)
         self.assertIsNone(parse_flash_kib('No target attached'))
 
+    def test_host_config_inventory_is_bounded_fixed_and_never_inits_target(self):
+        root = Path(self.tmp.name) / 'scripts'
+        (root / 'target').mkdir(parents=True)
+        (root / 'target/stm32f1x.cfg').write_text('reset_config srst_nogate\n')
+        (root / 'target/unlisted.cfg').write_text('must not be returned')
+        (root / 'mem_helper.tcl').write_bytes(b'x' * (128 * 1024 + 1))
+        executable = Path(self.tmp.name) / 'openocd'
+        executable.write_bytes(b'fake executable')
+        version = type('Version', (), {'returncode': 0, 'stdout': '', 'stderr': 'fake version'})()
+        with patch('worker_core.OPENOCD_SCRIPT_ROOTS', (str(root),)), \
+             patch.dict('os.environ', {'OPENOCD_SCRIPTS': ''}), \
+             patch('worker_core.shutil.which', return_value=str(executable)), \
+             patch('worker_core.subprocess.run', return_value=version) as run:
+            result = self.worker.inspect_openocd_host()
+        self.assertEqual(result['executable_sha256'], hashlib.sha256(b'fake executable').hexdigest())
+        self.assertEqual(run.call_args.args[0], [str(executable), '--version'])
+        files = {s['path']: s for s in result['scripts']}
+        self.assertEqual(files[str(root / 'target/stm32f1x.cfg')]['content'], 'reset_config srst_nogate\n')
+        self.assertIn('size limit', files[str(root / 'mem_helper.tcl')]['error'])
+        self.assertNotIn(str(root / 'target/unlisted.cfg'), files)
+        self.assertIn('not proven', result['note'])
+
     def test_probe_uses_usb_cmsis_dap_and_never_flashes(self):
         output = '0x1ffff7e0: 0080\nflash size 128 KiB\n'
         with patch('subprocess.run', return_value=FakeCompleted(output)) as run:
@@ -71,6 +93,23 @@ class WorkerTests(unittest.TestCase):
         self.assertIn('target/stm32f1x.cfg', args)
         self.assertIn('adapter speed 100', args)
         self.assertNotIn('program', ' '.join(args))
+
+    def test_staged_hex_info_rehashes_and_rejects_changed_and_unknown(self):
+        stage = self.worker.stage_hex(base64.b64encode(good_hex()).decode())
+        result = self.worker.staged_hex_info(stage['artifact_id'])
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['sha256'], stage['sha256'])
+        self.assertEqual(Path(result['path']).read_bytes(), good_hex())
+        Path(result['path']).write_bytes(b'modified')
+        self.assertFalse(self.worker.staged_hex_info(stage['artifact_id'])['ok'])
+        self.assertFalse(self.worker.staged_hex_info('../escape')['ok'])
+
+    def test_staged_hex_info_rejects_unsafe_tcl_path(self):
+        with tempfile.TemporaryDirectory(prefix='unsafe brace } ') as directory:
+            worker = OpenOCDWorker(openocd='fake', staging_dir=directory)
+            item = worker.stage_hex(base64.b64encode(good_hex()).decode())
+            self.assertFalse(worker.staged_hex_info(item['artifact_id'])['ok'])
+            worker.close()
 
     def test_stage_flash_requires_double_confirmation(self):
         data = good_hex()

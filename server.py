@@ -29,6 +29,12 @@ def diagnose_host() -> dict:
 
 
 @mcp.tool()
+def inspect_openocd_host() -> dict:
+    """Read fixed OpenOCD config candidates and executable hash; no target access."""
+    return worker.inspect_openocd_host()
+
+
+@mcp.tool()
 def probe_target(speed_khz: int = 100, quirk: bool = False) -> dict:
     """Connect via USB CMSIS-DAP SWD, HALT STM32, inspect ID and actual flash size; do not program."""
     return worker.probe_target(speed_khz, quirk)
@@ -62,6 +68,12 @@ def stop_gdb_server() -> dict:
 def stage_hex(base64_hex: str, expected_sha256: str = "") -> dict:
     """Stage Intel HEX with checksum/range/SHA-256 checks; never program during staging."""
     return worker.stage_hex(base64_hex, expected_sha256)
+
+
+@mcp.tool()
+def staged_hex_info(artifact_id: str) -> dict:
+    """Rehash a staged HEX and return its generated OpenOCD path; no target access."""
+    return worker.staged_hex_info(artifact_id)
 
 
 @mcp.tool()

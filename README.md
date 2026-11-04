@@ -51,18 +51,24 @@ The Raspberry Pi 5 is named `edge`; use its LAN/mDNS hostname `edge.local`, or i
 | Tool | Effect |
 | --- | --- |
 | `diagnose_host` | Read-only Pi host/USB/OpenOCD diagnostics, no target contact |
+| `inspect_openocd_host` | Host-only executable hash/version and fixed candidate OpenOCD script contents; no target access |
 | `probe_target` | **Halts MCU**, reads target ID and flash capacity; no erase/program |
 | `fault_snapshot` | **Halts MCU** and reads fault status; CPU-register values are not yet reliably returned by the current tool (see verified findings below). No reset/program |
 | `start_gdb_server` | Start one persistent OpenOCD process for remote GDB on `:3333` |
 | `gdb_server_status` | Report server state, PID and recent OpenOCD logs |
 | `stop_gdb_server` | Stop persistent OpenOCD process |
 | `stage_hex` | Stage an Intel HEX image sent as base64; checks checksums, address range and SHA-256; **does not flash** |
+| `staged_hex_info` | Rehash a staged HEX and return its generated OpenOCD path; **does not access the target** |
 | `flash_hex` | Destructive: probe capacity, **erase/program/verify/reset** a staged image, only with matching SHA-256 plus `confirm="FLASH"` |
 | `serial_list_ports` | List configured USB serial devices and presence |
 | `serial_capture` | Bounded UART receive without transmission |
 | `serial_at_query` | Bounded read-only AT query, complete response and raw bytes |
 | `serial_at_command` | Opt-in AT configuration command, requires `confirm="AT_WRITE"` |
 | `serial_exchange` | Opt-in bounded Base64-encoded UART transmit, requires `confirm="SEND"` |
+
+`staged_hex_info(artifact_id)` reports the generated path only while the worker and staged artifact exist, after rechecking the file hash; it accepts no user path. A worker restart may invalidate the ID and delete its temporary files. The path is not authorization to program; any future GDB/OpenOCD programming commands require separate review and explicit approval.
+
+`inspect_openocd_host()` reads only a fixed list of script filenames under `OPENOCD_SCRIPTS`, `/usr/local/share/openocd/scripts` and `/usr/share/openocd/scripts`, and runs the configured OpenOCD executable only with `--version`. It returns candidate contents and hashes, not proof of the active search order, embedded Tcl, build source, or deployed flash-driver behavior. No arbitrary file path or command can be supplied.
 
 The optional `quirk=true` parameter requests OpenOCD CMSIS-DAP single-packet compatibility mode (if supported by installed OpenOCD). `speed_khz` defaults to **100** to debug unreliable links. Official probe firmware v2.3.1 or v2.2.3 may be useful as a comparison when diagnosing Pi 5-specific issues.
 

@@ -24,6 +24,11 @@ FLASH_START = 0x08000000
 FLASH_LIMIT = FLASH_START + 128 * 1024
 MAX_HEX_BYTES = 2 * 1024 * 1024
 MAX_LOG_CHARS = 20_000
+# Fixed allowlist: this host-only diagnostic never invokes OpenOCD's init.
+OPENOCD_CONFIG_FILES = ("interface/cmsis-dap.cfg", "target/stm32f1x.cfg",
+                        "target/swj-dp.tcl", "mem_helper.tcl")
+OPENOCD_SCRIPT_ROOTS = ("/usr/local/share/openocd/scripts", "/usr/share/openocd/scripts")
+MAX_DIAGNOSTIC_FILE_BYTES = 128 * 1024
 
 
 class WorkerError(ValueError):
@@ -172,6 +177,50 @@ class OpenOCDWorker:
         return {"host": socket.gethostname(), "tools": results,
                 "hint": "Official Debug Probe USB ID is 2e8a:000c; check firmware with lsusb -v."}
 
+    def inspect_openocd_host(self) -> dict:
+        """Read fixed config candidates and binary metadata; no OpenOCD target access.
+
+        Results are candidates, not proof of OpenOCD's effective search path,
+        compiled-in Tcl or the exact source used to build the executable.
+        """
+        executable = shutil.which(self.openocd)
+        result = {"configured_executable": self.openocd, "resolved_executable": executable,
+                  "openocd_scripts_env": os.getenv("OPENOCD_SCRIPTS"), "scripts": [],
+                  "note": "Candidate files only; effective search order and embedded Tcl are not proven."}
+        if executable:
+            try:
+                digest = hashlib.sha256()
+                with open(executable, "rb") as stream:
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                result["executable_sha256"] = digest.hexdigest()
+                version = subprocess.run([executable, "--version"], capture_output=True,
+                                         text=True, errors="replace", timeout=8, check=False)
+                result["version"] = {"exit_code": version.returncode,
+                                     "output": (version.stdout + version.stderr)[-3000:]}
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                result["executable_error"] = str(exc)
+        roots = list(OPENOCD_SCRIPT_ROOTS)
+        env_root = os.getenv("OPENOCD_SCRIPTS")
+        if env_root:
+            roots.insert(0, env_root)
+        for root in dict.fromkeys(roots):
+            for relative in OPENOCD_CONFIG_FILES:
+                path = Path(root) / relative
+                try:
+                    with path.open("rb") as stream:
+                        data = stream.read(MAX_DIAGNOSTIC_FILE_BYTES + 1)
+                    if len(data) > MAX_DIAGNOSTIC_FILE_BYTES:
+                        result["scripts"].append({"path": str(path), "error": "file exceeds size limit"})
+                        continue
+                    result["scripts"].append({"path": str(path), "sha256": hashlib.sha256(data).hexdigest(),
+                                              "content": data.decode("utf-8", errors="replace")})
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    result["scripts"].append({"path": str(path), "error": str(exc)})
+        return result
+
     def probe_target(self, speed_khz: int = 100, quirk: bool = False) -> dict:
         commands = ["init", "halt", "targets", "mdw 0xE0042000 1", "mdh 0x1FFFF7E0 1",
                     "flash probe 0", "flash info 0", "shutdown"]
@@ -267,6 +316,26 @@ class OpenOCDWorker:
             self._images[artifact_id] = {"path": path, "digest": digest, **info}
         return {"ok": True, "artifact_id": artifact_id, "sha256": digest,
                 "uploaded_bytes": len(data), **info}
+
+    def staged_hex_info(self, artifact_id: str) -> dict:
+        """Inspect an existing staged image without target access or mutation."""
+        with self._lock:
+            image = self._images.get(artifact_id)
+            if not image:
+                return {"ok": False, "error": "Unknown staged image"}
+            path = image["path"]
+            try:
+                current = hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError as exc:
+                return {"ok": False, "error": str(exc)}
+            if current != image["digest"]:
+                return {"ok": False, "error": "Staged file has changed"}
+            name = str(path)
+            if not re.fullmatch(r"/[A-Za-z0-9_./-]+", name):
+                return {"ok": False, "error": "Staged path is not safe for the reviewed OpenOCD syntax"}
+            return {"ok": True, "path": name, "sha256": current,
+                    "start": image["start"], "end_exclusive": image["end_exclusive"],
+                    "data_bytes": image["data_bytes"]}
 
     def flash_hex(self, artifact_id: str, confirm_sha256: str, confirm: str = "", speed_khz: int = 100,
                   quirk: bool = False) -> dict:
