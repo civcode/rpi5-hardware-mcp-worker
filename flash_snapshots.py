@@ -23,7 +23,8 @@ FLASH_START = 0x08000000
 ALLOWED_FLASH_KIB = (64, 128)
 PAGE_BYTES = 1024
 _ID = re.compile(r"[0-9a-f]{32}\Z")
-_KIB = re.compile(r"FLASH_SNAPSHOT_KIB=(64|128)\b")
+# Tcl read_memory may print capacity as 0x80 (hex) rather than 128 (decimal).
+_KIB = re.compile(r"FLASH_SNAPSHOT_KIB=(0[xX][0-9A-Fa-f]+|[0-9]+)(?![0-9A-Za-z_])")
 _DUMP_OK = "FLASH_SNAPSHOT_DUMP_OK"
 _RESUME_OK = "FLASH_SNAPSHOT_RESUME_OK"
 _MAX_LOG = 8000
@@ -210,7 +211,9 @@ class FlashSnapshotStore:
                                     text=True, errors="replace", check=False, timeout=timeout)
             output = result.stdout
             match = _KIB.search(output)
-            kib = int(match.group(1)) if match else None
+            raw_kib = match.group(1) if match else None
+            kib = (int(raw_kib, 16 if raw_kib.lower().startswith("0x") else 10)
+                   if raw_kib else None)
             if (result.returncode != 0 or kib not in ALLOWED_FLASH_KIB or
                     _DUMP_OK not in output or _RESUME_OK not in output):
                 return {"ok": False, "error": "OpenOCD capture or explicit resume failed",
