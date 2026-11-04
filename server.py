@@ -12,15 +12,17 @@ from worker_lifecycle import run_with_cleanup
 from serial_core import SerialWorker, serial_tool_result
 
 worker = OpenOCDWorker()
-serial_worker = SerialWorker(allow_writes=os.getenv("RPI5_SERIAL_ENABLE_WRITES") == "1")
+serial_worker = SerialWorker(allow_writes=os.getenv("RPI5_SERIAL_ENABLE_WRITES") == "1")  # Raw serial_exchange only
 atexit.register(worker.close)
 
 mcp = MCPServer(
     "rpi5-hardware",
     instructions=("USB CMSIS-DAP/OpenOCD and UART/AT tools for STM32F103 BU03/BU04. "
                   "SWD probes halt the MCU; flashing requires explicit SHA-256 confirmation. "
-                  "AT queries use a read-only command allowlist. Raw/setting UART writes "
-                  "require RPI5_SERIAL_ENABLE_WRITES=1 and per-call confirmation."),
+                  "AT queries use a read-only command allowlist. Confirmed AT setters "
+                  "and SAVE require confirm='AT_WRITE' but no startup unlock. "
+                  "Unrestricted raw UART still requires RPI5_SERIAL_ENABLE_WRITES=1 "
+                  "and confirm='SEND'."),
 )
 
 
@@ -148,7 +150,7 @@ def serial_at_query(command: str, port: str = "", baudrate: int = 115200,
 def serial_at_command(command: str, confirm: str = "", port: str = "",
                       baudrate: int = 115200, timeout_ms: int = 2500,
                       max_bytes: int = 4096) -> dict:
-    """Opt-in AT command; <=61 ASCII bytes + CRLF, 5 ms byte pacing; confirm='AT_WRITE'."""
+    """AT setter/save with confirm='AT_WRITE'; <=61 ASCII bytes + CRLF, paced 5 ms/byte; no startup unlock."""
     return serial_tool_result(serial_worker.serial_at_command, command, confirm, port, baudrate, timeout_ms, max_bytes)
 
 
