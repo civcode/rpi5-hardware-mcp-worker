@@ -63,8 +63,9 @@ def _allowed_ports(raw: str) -> tuple[str, ...]:
 class SerialWorker:
     """Serial access is serialized for the process and exclusive on POSIX.
 
-    A read-only *AT query* still transmits UART bytes. Only exact known query
-    commands are available without enabling state-changing serial operations.
+    AT commands need per-call confirmation but no service-wide write switch.
+    The legacy allow_writes flag applies only to unrestricted raw exchanges.
+    Read-only query tools still use a strict command allowlist.
     """
 
     def __init__(self, ports: tuple[str, ...] | None = None, allow_writes: bool = False,
@@ -259,9 +260,13 @@ class SerialWorker:
     def serial_at_command(self, command: str, confirm: str = "", port: str = "",
                           baudrate: int = 115200, timeout_ms: int = 2500,
                           max_bytes: int = MAX_RX) -> dict:
-        """Opt-in AT configuration command, with no terminal-character injection."""
-        if not self.allow_writes or confirm != "AT_WRITE":
-            raise SerialError("State-changing AT commands disabled or missing confirm='AT_WRITE'")
+        """Confirmed AT setter/save, independent of raw-write service setting.
+
+        Still enforces printable ASCII, 61-character text limit, CRLF framing,
+        5 ms pacing, and per-call confirm='AT_WRITE'.
+        """
+        if confirm != "AT_WRITE":
+            raise SerialError("AT configuration command requires confirm='AT_WRITE'")
         tx = self._at_frame(command)
         chosen = self._device(port)
         _integer(timeout_ms, "timeout_ms", 100, 10000)
