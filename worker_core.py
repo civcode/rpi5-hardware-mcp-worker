@@ -19,6 +19,8 @@ import threading
 import time
 import uuid
 
+from flash_snapshots import FlashSnapshotStore
+
 
 FLASH_START = 0x08000000
 FLASH_LIMIT = FLASH_START + 128 * 1024
@@ -128,6 +130,7 @@ class OpenOCDWorker:
         self._log_handle = None
         self._port = 3333
         self._images: dict[str, dict] = {}
+        self.flash_snapshots = FlashSnapshotStore()
 
     def close(self) -> None:
         self.stop_gdb_server()
@@ -220,6 +223,38 @@ class OpenOCDWorker:
                 except OSError as exc:
                     result["scripts"].append({"path": str(path), "error": str(exc)})
         return result
+
+
+    def flash_snapshot(self, speed_khz: int = 1000, label: str = "",
+                       quirk: bool = False) -> dict:
+        """Dump detected 64/128 KiB main flash without programming or resetting.
+
+        Temporarily halts MCU, then attempts explicit resume even on read error.
+        Never shares the probe with a worker-managed OpenOCD GDB server.
+        """
+        validate_speed(speed_khz)
+        with self._lock:
+            if self._server_running():
+                return {"ok": False, "error": "GDB server owns the probe. Stop it before taking a snapshot."}
+            return self.flash_snapshots.capture(self._args(speed_khz, quirk), self.workspace, label)
+
+    def flash_snapshot_info(self, snapshot_id: str) -> dict:
+        """Check persistent snapshot hash and metadata; host-only."""
+        return self.flash_snapshots.info(snapshot_id)
+
+    def flash_snapshot_list(self) -> dict:
+        """List persistent snapshot IDs, sizes and hashes; host-only."""
+        return self.flash_snapshots.list_snapshots()
+
+    def flash_snapshot_chunk(self, snapshot_id: str, offset: int = 0,
+                             length: int = 4096) -> dict:
+        """Return a hash-checked, bounded Base64 segment; host-only."""
+        return self.flash_snapshots.chunk(snapshot_id, offset, length)
+
+    def flash_snapshot_diff(self, before_id: str, after_id: str,
+                            label: str = "") -> dict:
+        """Diff two saved images offline and write complete JSON/CSV reports."""
+        return self.flash_snapshots.diff(before_id, after_id, label)
 
     def probe_target(self, speed_khz: int = 100, quirk: bool = False) -> dict:
         commands = ["init", "halt", "targets", "mdw 0xE0042000 1", "mdh 0x1FFFF7E0 1",
