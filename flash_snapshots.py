@@ -159,6 +159,7 @@ class FlashSnapshotStore:
                     found.append(self.info(path.stem))
                 except (SnapshotError, OSError):
                     continue
+        found.sort(key=lambda item: item.get("captured_utc", ""))
         return {"ok": True, "snapshots": found[-100:], "total": len(found),
                 "directory": str(self.directory)}
 
