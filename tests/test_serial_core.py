@@ -155,28 +155,28 @@ class SerialCoreTests(unittest.TestCase):
         self.assertTrue(result["transmitted"])
         self.assertEqual(enabled_instances[0].writes, [b"AT+RESTORE\r\n"])
 
-    def test_at_command_requires_confirmation_but_no_service_switch(self):
-        # The previously blocked stock configuration setter must work with
-        # allow_writes=False (the worker's standard startup configuration).
+    def test_at_command_needs_no_confirmation_or_service_switch(self):
+        # The stock setter and SAVE work with the default worker config.
+        # This test uses fake UART only; it never writes STM32 flash.
         worker, instances = self.make_worker()
-        with self.assertRaisesRegex(SerialError, "AT_WRITE"):
-            worker.serial_at_command("AT+PDOAOFF=37")
-        self.assertEqual(instances, [])
         for malformed in ("AT\rAT+RESTORE", "AT\n", "at+SAVE", "AT\x00", "XAT", "AT" + "a" * 160):
             with self.assertRaises(SerialError):
-                worker.serial_at_command(malformed, "AT_WRITE")
+                worker.serial_at_command(malformed)
         self.assertEqual(instances, [])
 
-        result = worker.serial_at_command("AT+PDOAOFF=37", "AT_WRITE", timeout_ms=100)
+        result = worker.serial_at_command("AT+PDOAOFF=37", timeout_ms=100)
         self.assertEqual(result["status"], "OK")
         self.assertEqual(b"".join(instances[0].writes), b"AT+PDOAOFF=37\r\n")
         self.assertTrue(all(len(chunk) == 1 for chunk in instances[0].writes))
 
-        # AT+SAVE also works with the default worker configuration; the
-        # test uses only a fake UART and never actually writes flash.
-        saved = worker.serial_at_command("AT+SAVE", "AT_WRITE", timeout_ms=100)
+        saved = worker.serial_at_command("AT+SAVE", timeout_ms=100)
         self.assertEqual(saved["status"], "OK")
         self.assertEqual(b"".join(instances[1].writes), b"AT+SAVE\r\n")
+
+    def test_at_command_signature_does_not_expose_confirmation(self):
+        import inspect
+        params = inspect.signature(SerialWorker.serial_at_command).parameters
+        self.assertNotIn("confirm", params)
 
     def test_raw_exchange_remains_service_gated(self):
         worker, instances = self.make_worker()
@@ -189,21 +189,21 @@ class SerialCoreTests(unittest.TestCase):
         worker, instances = self.make_worker(allow_writes=True)
         valid = "AT" + "A" * (AT_MAX_TEXT_BYTES - 2)
         assert len(valid) == AT_MAX_TEXT_BYTES
-        result = worker.serial_at_command(valid, "AT_WRITE", timeout_ms=100)
+        result = worker.serial_at_command(valid, timeout_ms=100)
         self.assertTrue(result["ok"])
         self.assertEqual(b"".join(instances[-1].writes), (valid + "\r\n").encode("ascii"))
         self.assertEqual(sum(map(len, instances[-1].writes)), AT_MAX_FRAME_BYTES)
 
         too_long = valid + "A"
         with self.assertRaisesRegex(SerialError, "61 bytes"):
-            worker.serial_at_command(too_long, "AT_WRITE")
+            worker.serial_at_command(too_long)
         self.assertEqual(len(instances), 1, "oversized frame must be rejected before opening serial port")
 
     def test_historical_setdev_example_is_rejected_without_transmit(self):
         worker, instances = self.make_worker(allow_writes=True)
         command = "AT+SETDEV=2,0,0,0.000000,0.000000,1.000000,0.000000,1,795110505"
         self.assertGreater(len(command), AT_MAX_TEXT_BYTES)
-        result = serial_tool_result(worker.serial_at_command, command, "AT_WRITE")
+        result = serial_tool_result(worker.serial_at_command, command)
         self.assertFalse(result["ok"])
         self.assertIn("61 bytes", result["error"])
         self.assertEqual(instances, [])
