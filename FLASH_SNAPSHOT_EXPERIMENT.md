@@ -35,6 +35,8 @@ similar CMSIS-DAP adapters. Verify the board and firmware version via
 
 Only 64- and 128-KiB STM32F103 targets are accepted; flash size is read
 from factory information memory in the **same OpenOCD session** as the dump.
+OpenOCD may report it as decimal `128` or hex `0x80`; both are accepted,
+with the exact raw dump size verified before the snapshot is saved.
 A 64-KiB device does not include the historical configuration address
 `0x08013800`; flag that mismatch rather than assuming page 78 exists.
 
