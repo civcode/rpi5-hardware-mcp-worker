@@ -56,7 +56,9 @@ python3 -m venv .venv
 ./start.sh
 ```
 
-The console process listens on `0.0.0.0:8766` and exposes `http://edge.local:8766/mcp`. Ctrl+C stops it. No systemd unit is required. Use `RPI5_MCP_HOST`, `RPI5_MCP_PORT` and `OPENOCD` environment variables if needed.
+The console process listens on `0.0.0.0:8766` and exposes `http://edge.local:8766/mcp`. **Press Ctrl+C once** to request a graceful shutdown: Uvicorn stops serving, then the worker terminates its own persistent OpenOCD/GDB subprocess, releases its temporary workspace and prints `Hardware MCP worker stopped.`. Saved flash snapshots remain on disk. The worker does **not** reset, flash, or attempt to resume/halt the MCU during shutdown. If an SWD read or active GDB session was interrupted, check target execution separately. No systemd unit is required. Use `RPI5_MCP_HOST`, `RPI5_MCP_PORT` and `OPENOCD` environment variables if needed.
+
+**Deployment is manual on `edge`.** The Pi coding agent on Oberon interacts with the running worker over the MCP HTTP endpoint; it does not require SSH. To update the checkout manually, stop the current server with Ctrl+C, `git pull --ff-only` on the selected branch, run the Python tests locally, then `./start.sh` again.
 
 Test without the worker: `openocd -f interface/cmsis-dap.cfg -c 'transport select swd' -f target/stm32f1x.cfg -c 'adapter speed 100' -c 'init' -c 'halt' -c 'shutdown'`.
 
