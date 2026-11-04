@@ -34,6 +34,37 @@ def inspect_openocd_host() -> dict:
     return worker.inspect_openocd_host()
 
 
+
+@mcp.tool()
+def flash_snapshot(speed_khz: int = 1000, label: str = "", quirk: bool = False) -> dict:
+    """Read 64/128 KiB STM32 main flash via SWD, HALT then explicitly RESUME; never flash or reset."""
+    return worker.flash_snapshot(speed_khz, label, quirk)
+
+
+@mcp.tool()
+def flash_snapshot_list() -> dict:
+    """List persistent snapshot IDs and SHA-256 hashes; host-only, no target access."""
+    return worker.flash_snapshot_list()
+
+
+@mcp.tool()
+def flash_snapshot_info(snapshot_id: str) -> dict:
+    """Rehash a saved snapshot and return size/path/metadata; host-only."""
+    return worker.flash_snapshot_info(snapshot_id)
+
+
+@mcp.tool()
+def flash_snapshot_chunk(snapshot_id: str, offset: int = 0, length: int = 4096) -> dict:
+    """Read at most 8192 bytes of a saved snapshot as Base64, hash-checked; host-only."""
+    return worker.flash_snapshot_chunk(snapshot_id, offset, length)
+
+
+@mcp.tool()
+def flash_snapshot_diff(before_id: str, after_id: str, label: str = "") -> dict:
+    """Offline compare saved flash images; store exhaustive byte CSV and range JSON; no target access."""
+    return worker.flash_snapshot_diff(before_id, after_id, label)
+
+
 @mcp.tool()
 def probe_target(speed_khz: int = 100, quirk: bool = False) -> dict:
     """Connect via USB CMSIS-DAP SWD, HALT STM32, inspect ID and actual flash size; do not program."""
