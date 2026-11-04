@@ -256,6 +256,11 @@ class OpenOCDWorker:
         """Diff two saved images offline and write complete JSON/CSV reports."""
         return self.flash_snapshots.diff(before_id, after_id, label)
 
+    def flash_snapshot_diff_chunk(self, diff_id: str, format: str = "csv",
+                                  offset: int = 0, length: int = 4096) -> dict:
+        """Return a bounded saved diff-report fragment, without touching target."""
+        return self.flash_snapshots.diff_chunk(diff_id, format, offset, length)
+
     def probe_target(self, speed_khz: int = 100, quirk: bool = False) -> dict:
         commands = ["init", "halt", "targets", "mdw 0xE0042000 1", "mdh 0x1FFFF7E0 1",
                     "flash probe 0", "flash info 0", "shutdown"]
