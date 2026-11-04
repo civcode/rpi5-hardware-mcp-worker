@@ -143,6 +143,22 @@ class SnapshotTests(unittest.TestCase):
             with self.assertRaises(SnapshotError):
                 self.store.chunk(snap["snapshot_id"], offset, length)
 
+    def test_diff_report_chunks_allow_mcp_download(self):
+        a = self.capture(self.first)
+        b = self.capture(bytes(self.second))
+        report = self.store.diff(a["snapshot_id"], b["snapshot_id"])
+        for kind in ("csv", "json"):
+            result = self.store.diff_chunk(report["diff_id"], kind, 0, 128)
+            data = Path(report[f"{kind}_path"]).read_bytes()
+            self.assertEqual(base64.b64decode(result["base64"]), data[:128])
+            self.assertEqual(result["report_sha256"], hashlib.sha256(data).hexdigest())
+
+    def test_diff_report_rejects_invalid_ids_and_formats(self):
+        with self.assertRaises(SnapshotError):
+            self.store.diff_chunk("../etc/passwd")
+        with self.assertRaises(SnapshotError):
+            self.store.diff_chunk("0" * 32, "txt")
+
     def test_unchanged_same_and_packed_integer_ranges(self):
         self.assertEqual(analyze_difference(b"\x01\x02", b"\x01\x02")["changed_bytes"], 0)
         with self.assertRaises(SnapshotError):
