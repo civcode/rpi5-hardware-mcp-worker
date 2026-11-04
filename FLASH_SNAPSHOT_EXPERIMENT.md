@@ -50,6 +50,7 @@ Likewise, stop any **independent** OpenOCD/GDB sessions first.
 | `flash_snapshot_info(snapshot_id)` | No | Verify persisted image SHA-256 and metadata |
 | `flash_snapshot_chunk(snapshot_id, offset=0, length=4096)` | No | Fetch 1–8192 image bytes as Base64, with per-chunk hash |
 | `flash_snapshot_diff(before_id, after_id, label="")` | No | Compare images of equal capacity, write full `diff-*.json` and `diff-*.csv`; return summary and first 64 ranges |
+| `flash_snapshot_diff_chunk(diff_id, format="csv", offset=0, length=4096)` | No | Fetch 1–8192 bytes of a saved CSV/JSON diff report as Base64 with hashes |
 
 The tool produces a 128-KiB image (if the target reports 128 KiB), or a
 64-KiB image (if it reports 64 KiB). Capture files never include STM32
@@ -102,6 +103,18 @@ flash_snapshot_diff(before_id=A.snapshot_id,
 
 After an authorized `AT+SAVE`, call `flash_snapshot` again and compare.
 `flash_snapshot_diff` must never issue AT commands or OpenOCD commands.
+
+## Offline comparison of existing backups
+
+No probe or MCP worker is required for binary backups already available on the host:
+
+```bash
+python3 flash_snapshots.py before.bin after.bin --csv changes.csv --json changes.json
+```
+
+This accepts complete 64- or 128-KiB raw **main-flash** images; it does not
+compare Intel HEX files or program the board. The console prints changed
+pages and the first 64 ranges, while `changes.csv` lists every changed byte.
 
 ## How to interpret the diff
 
