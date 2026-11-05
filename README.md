@@ -1,6 +1,6 @@
 # Raspberry Pi 5 hardware MCP worker
 
-A **plain-LAN-HTTP** Model Context Protocol worker for Raspberry Pi 5 hardware access: OpenOCD/SWD through the Raspberry Pi Debug Probe and USB-UART/AT commands (default `/dev/ttyUSB0`) for the STM32F103 BU03/BU04 UWB kit.
+A **plain-LAN-HTTP** Model Context Protocol worker for Raspberry Pi 5 hardware access: OpenOCD/SWD through the Raspberry Pi Debug Probe and USB-UART/AT commands (default allowed ports `/dev/ttyUSB0` and `/dev/ttyACM0`) for the STM32F103 BU03/BU04 UWB kit.
 
 This is **not** a replacement for GDB or OpenOCD. The worker runs OpenOCD **on the Pi**, offers a few Pi coding agent tools, and starts/stops an OpenOCD **GDB TCP server on port 3333**. GDB on the Oberon workstation can connect directly to `edge.local:3333` and use the **local ATfE ELF with symbols**. It does not require SSH, TLS, a service manager, or a checkout of the SDK on the Pi. UART uses `pyserial` and shares the existing MCP endpoint.
 
@@ -17,6 +17,43 @@ Oberon (Linux)
 
 MCP controls SWD and UART; native remote GDB is the interactive debugging plane. **One OpenOCD process owns the physical probe at a time.** If the GDB server is active, standalone `probe_target`, `fault_snapshot` and `flash_hex` refuse to start another connection; use `monitor` in GDB or stop the GDB server first.
 
+## Flash snapshots and stock V1.0.1 configuration mapping
+
+The `flash_snapshot` MCP tool temporarily halts the STM32, reads its **entire
+detected 64- or 128-KiB main flash** through OpenOCD, explicitly attempts to
+resume it, and stores a SHA-256-verified binary under
+`~/rpi5-flash-snapshots` (customize with `RPI5_FLASH_SNAPSHOT_DIR`).
+It does **not** reset, erase or program the MCU. Installed OpenOCD target
+scripts may nevertheless alter debug-related registers during attach.
+
+`flash_snapshot_list`, `flash_snapshot_info`,
+`flash_snapshot_chunk`, `flash_snapshot_diff`, and
+`flash_snapshot_diff_chunk` operate **entirely on host-side stored files**.
+Diffs return changed pages/ranges and write exhaustive JSON and CSV with
+per-byte old/new values and candidate little-endian numeric interpretations.
+The chunk APIs retrieve saved binaries/reports over MCP without requiring SSH.
+
+Both guarded AT endpoints (`serial_at_query` and `serial_at_command`)
+reject commands over **61 printable ASCII bytes**, because they append CRLF and
+the historical STM32 receive buffer wraps at a 64-byte frame. Commands are
+transmitted **one byte at a time**, with a 5 ms inter-byte pause and a
+transmitter flush after each byte, matching the historical host workaround.
+These are conservative 2024-source constraints, not a measurement of the
+binary-only 2026 firmware. The generic `serial_exchange` raw endpoint does
+**not** apply these AT protections and must not be used for AT configuration
+experiments.
+
+For a controlled one-setting-at-a-time stock firmware experiment, see
+**[FLASH_SNAPSHOT_EXPERIMENT.md](FLASH_SNAPSHOT_EXPERIMENT.md)**. Sending
+`AT+SAVE` is a separate operation that **does** write flash and reset; it
+is never initiated by the snapshot/diff tools.
+
+Existing binary backups can also be compared **without any hardware**:
+
+```bash
+python3 flash_snapshots.py before.bin after.bin --csv changes.csv --json changes.json
+```
+
 ## Install on Raspberry Pi 5 (headless Raspberry Pi OS)
 
 ```bash
@@ -29,7 +66,9 @@ python3 -m venv .venv
 ./start.sh
 ```
 
-The console process listens on `0.0.0.0:8766` and exposes `http://edge.local:8766/mcp`. Ctrl+C stops it. No systemd unit is required. Use `RPI5_MCP_HOST`, `RPI5_MCP_PORT` and `OPENOCD` environment variables if needed.
+The console process listens on `0.0.0.0:8766` and exposes `http://edge.local:8766/mcp`. **Press Ctrl+C once** to request a graceful shutdown: Uvicorn stops serving, then the worker terminates its own persistent OpenOCD/GDB subprocess, releases its temporary workspace and prints `Hardware MCP worker stopped.`. Saved flash snapshots remain on disk. The worker does **not** reset, flash, or attempt to resume/halt the MCU during shutdown. If an SWD read or active GDB session was interrupted, check target execution separately. No systemd unit is required. Use `RPI5_MCP_HOST`, `RPI5_MCP_PORT` and `OPENOCD` environment variables if needed.
+
+**Deployment is manual on `edge`.** The Pi coding agent on Oberon interacts with the running worker over the MCP HTTP endpoint; it does not require SSH. To update the checkout manually, stop the current server with Ctrl+C, `git pull --ff-only` on the selected branch, run the Python tests locally, then `./start.sh` again.
 
 Test without the worker: `openocd -f interface/cmsis-dap.cfg -c 'transport select swd' -f target/stm32f1x.cfg -c 'adapter speed 100' -c 'init' -c 'halt' -c 'shutdown'`.
 
@@ -56,6 +95,7 @@ The Raspberry Pi 5 is named `edge`; use its LAN/mDNS hostname `edge.local`, or i
 | `fault_snapshot` | **Halts MCU** and reads fault status; CPU-register values are not yet reliably returned by the current tool (see verified findings below). No reset/program |
 | `start_gdb_server` | Start one persistent OpenOCD process for remote GDB on `:3333` |
 | `gdb_server_status` | Report server state, PID and recent OpenOCD logs |
+| `gdb_command` | Persistent GDB console/MI command transport; no token required |
 | `stop_gdb_server` | Stop persistent OpenOCD process |
 | `stage_hex` | Stage an Intel HEX image sent as base64; checks checksums, address range and SHA-256; **does not flash** |
 | `staged_hex_info` | Rehash a staged HEX and return its generated OpenOCD path; **does not access the target** |
@@ -63,8 +103,8 @@ The Raspberry Pi 5 is named `edge`; use its LAN/mDNS hostname `edge.local`, or i
 | `serial_list_ports` | List configured USB serial devices and presence |
 | `serial_capture` | Bounded UART receive without transmission |
 | `serial_at_query` | Bounded read-only AT query, complete response and raw bytes |
-| `serial_at_command` | Opt-in AT configuration command, requires `confirm="AT_WRITE"` |
-| `serial_exchange` | Opt-in bounded Base64-encoded UART transmit, requires `confirm="SEND"` |
+| `serial_at_command` | AT setters and `AT+SAVE`, no startup unlock or confirmation argument; AT length and pacing guards remain |
+| `serial_exchange` | Raw Base64 UART transmit, still disabled unless `RPI5_SERIAL_ENABLE_WRITES=1` and `confirm="SEND"` |
 
 `staged_hex_info(artifact_id)` reports the generated path only while the worker and staged artifact exist, after rechecking the file hash; it accepts no user path. A worker restart may invalidate the ID and delete its temporary files. The path is not authorization to program; any future GDB/OpenOCD programming commands require separate review and explicit approval.
 
@@ -74,16 +114,30 @@ The optional `quirk=true` parameter requests OpenOCD CMSIS-DAP single-packet com
 
 **Flash normally via GDB `load` instead of passing a large HEX through MCP**: it works directly with the ELF on Oberon, retains debug symbols, and avoids a file transfer. `stage_hex`/`flash_hex` are optional for agent-controlled program/verify tests and perform capacity/hash checks.
 
+### MCP GDB command transport
+
+The `gdb_command(command, timeout_seconds=30)` tool forwards GDB
+console commands or native MI commands (prefixed with `-`) through a persistent
+`gdb-multiarch` session on the Pi. Start OpenOCD using `start_gdb_server` first.
+Use an empty command to poll pending MI output; `stop_gdb_server` ends the session.
+
+No token or command allowlist is required. Commands can affect the Pi and
+MCU, including writing memory or programming flash. The MCP HTTP endpoint
+is plaintext and should remain reachable only from the protected development
+network. Avoid exposing port 8766 to untrusted clients.
+On a command timeout the client session is closed and the target state is unknown.
+
 ## USB-UART and AT commands
 
 The UART tools use the existing plain-HTTP endpoint `http://edge.local:8766/mcp`. Network listeners remain unchanged (`0.0.0.0:8766`; GDB port 3333 when started). No authentication, TLS, or firewall changes are introduced.
 
 - Install dependencies in the Pi virtual environment: `.venv/bin/python -m pip install -r requirements.txt`; this includes `pyserial`.
-- Default serial port: `/dev/ttyUSB0`. Configure additional permitted device paths with `RPI5_SERIAL_PORTS=/dev/ttyUSB0,/dev/serial/by-id/your-adapter`. An empty `port` argument selects the first configured path.
+- Default allowed serial ports: `/dev/ttyUSB0`, `/dev/ttyACM0` (in that order). Configure an explicit replacement allowlist with `RPI5_SERIAL_PORTS=/dev/ttyUSB0,/dev/ttyACM0,/dev/serial/by-id/your-adapter`. An empty `port` argument selects the first configured path. Environment overrides replace the defaults and must explicitly include `/dev/ttyACM0` if required.
 - Default UART: **115200 baud, 8N1**, no software or hardware flow control. Calls use finite timeouts, at most **4096 received bytes** and at most **256 transmitted bytes**.
 - `serial_list_ports()` reports presence and USB identifiers. `serial_capture(duration_ms=1000)` listens for unsolicited traffic without transmitting bytes.
 - `serial_at_query(command="AT+GETVER")` transmits `AT+GETVER\r\n` and returns `rx_base64`, `rx_hex`, `rx_gb18030`, `status` (`OK`, `ERROR`, or `INCOMPLETE`) and `complete`. Read-only allowlist: `AT`, `AT+GETVER`, `AT+GETCFG`, `AT+GETDEV`, `AT+GETUWBMODE`, `AT+PDOAGETCFG`, `AT+GETDLIST`, `AT+GETKLIST`. The quiet-window check refuses to transmit when unsolicited bytes are already present; use `serial_capture` to diagnose chatty firmware.
-- To enable setting changes, start the worker with `RPI5_SERIAL_ENABLE_WRITES=1 ./start.sh`, then call `serial_at_command(command="AT+RESTORE", confirm="AT_WRITE")`. For arbitrary bounded byte exchanges use `serial_exchange(tx_base64="...", confirm="SEND")`. Both methods are off by default. The per-call confirmation is an *operation guard*, not network authentication.
+- **AT setters and `AT+SAVE` need no startup unlock or confirmation string.** Run `./start.sh` normally and use `serial_at_command(command="AT+PDOAOFF=37")`, or another short AT command. The command length (61 printable ASCII bytes plus CRLF), single-line validation, and 5 ms byte pacing remain enforced. Commands can modify settings or flash; use this tool only for intentional operations.
+- **Raw UART exchange is separate and remains disabled by default.** Only if a raw-byte workflow is explicitly needed, start with `RPI5_SERIAL_ENABLE_WRITES=1 ./start.sh` and use `serial_exchange(tx_base64="...", confirm="SEND")`. The stock layout-analysis task should never need this endpoint.
 - Raw Base64 and hex outputs preserve the exact received bytes; GB18030 text is display-only and may contain replacement characters. This is important for vendor AT responses containing control bytes.
 - After detecting a terminal line, queries continue collecting bytes until 100 ms of UART silence or the overall timeout/byte limit, so a split CR/LF is not normally left behind. The terminal marker and bounded quiet period do not prove that delayed unsolicited output or a premature `OK` belongs to the response; inspect the raw bytes when framing is uncertain.
 - Expected serial errors (such as a missing pyserial dependency, invalid parameters or a busy port) return `ok: false`, `error` and `error_type`. An error does not establish whether bytes were transmitted: a write or flush can fail after partial transmission. Check `ok` in the returned tool content; these application errors are not MCP transport errors.

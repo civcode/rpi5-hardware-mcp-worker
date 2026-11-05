@@ -1,8 +1,10 @@
 """Offline serial tests using an in-memory UART; no hardware needed."""
 import base64
 import unittest
+from unittest.mock import patch
 
-from serial_core import SerialWorker, SerialError, _allowed_ports, serial_tool_result
+from serial_core import (SerialWorker, SerialError, AT_MAX_TEXT_BYTES, AT_MAX_FRAME_BYTES,
+                         AT_INTER_BYTE_SECONDS, _allowed_ports, serial_tool_result)
 
 
 class FakeSerial:
@@ -34,7 +36,10 @@ class FakeSerial:
 
     def write(self, data):
         self.writes.append(data)
-        self._rx.extend(self._reply)
+        # Replies are generated once the complete CRLF frame arrives, not
+        # after each single byte of the paced transfer.
+        if data.endswith(b"\n"):
+            self._rx.extend(self._reply)
         return len(data)
 
     def flush(self):
@@ -87,7 +92,8 @@ class SerialCoreTests(unittest.TestCase):
         self.assertEqual(base64.b64decode(result["rx_base64"]), reply)
         self.assertEqual(result["status"], "OK")
         self.assertTrue(result["complete"])
-        self.assertEqual(instances[0].writes, [b"AT+GETKLIST\r\n"])
+        self.assertEqual(b"".join(instances[0].writes), b"AT+GETKLIST\r\n")
+        self.assertTrue(all(len(chunk) == 1 for chunk in instances[0].writes))
         self.assertEqual(instances[0].wire_settings, (False, False))
         self.assertTrue(instances[0].closed)
 
@@ -149,21 +155,78 @@ class SerialCoreTests(unittest.TestCase):
         self.assertTrue(result["transmitted"])
         self.assertEqual(enabled_instances[0].writes, [b"AT+RESTORE\r\n"])
 
-    def test_at_command_requires_opt_in_and_confirmation(self):
+    def test_at_command_needs_no_confirmation_or_service_switch(self):
+        # The stock setter and SAVE work with the default worker config.
+        # This test uses fake UART only; it never writes STM32 flash.
         worker, instances = self.make_worker()
-        with self.assertRaises(SerialError):
-            worker.serial_at_command("AT+RESTORE", "AT_WRITE")
-        self.assertEqual(instances, [])
-        enabled, open_instances = self.make_worker(allow_writes=True)
-        with self.assertRaises(SerialError):
-            enabled.serial_at_command("AT+RESTORE")
         for malformed in ("AT\rAT+RESTORE", "AT\n", "at+SAVE", "AT\x00", "XAT", "AT" + "a" * 160):
             with self.assertRaises(SerialError):
-                enabled.serial_at_command(malformed, "AT_WRITE")
-        self.assertEqual(open_instances, [])
-        result = enabled.serial_at_command("AT+RESTORE", "AT_WRITE", timeout_ms=100)
+                worker.serial_at_command(malformed)
+        self.assertEqual(instances, [])
+
+        result = worker.serial_at_command("AT+PDOAOFF=37", timeout_ms=100)
         self.assertEqual(result["status"], "OK")
-        self.assertEqual(open_instances[0].writes, [b"AT+RESTORE\r\n"])
+        self.assertEqual(b"".join(instances[0].writes), b"AT+PDOAOFF=37\r\n")
+        self.assertTrue(all(len(chunk) == 1 for chunk in instances[0].writes))
+
+        saved = worker.serial_at_command("AT+SAVE", timeout_ms=100)
+        self.assertEqual(saved["status"], "OK")
+        self.assertEqual(b"".join(instances[1].writes), b"AT+SAVE\r\n")
+
+    def test_at_command_signature_does_not_expose_confirmation(self):
+        import inspect
+        params = inspect.signature(SerialWorker.serial_at_command).parameters
+        self.assertNotIn("confirm", params)
+
+    def test_raw_exchange_remains_service_gated(self):
+        worker, instances = self.make_worker()
+        payload = base64.b64encode(b"AT+SAVE\r\n").decode("ascii")
+        with self.assertRaisesRegex(SerialError, "disabled"):
+            worker.serial_exchange(payload, confirm="SEND")
+        self.assertEqual(instances, [])
+
+    def test_at_frame_length_boundary_before_open(self):
+        worker, instances = self.make_worker(allow_writes=True)
+        valid = "AT" + "A" * (AT_MAX_TEXT_BYTES - 2)
+        assert len(valid) == AT_MAX_TEXT_BYTES
+        result = worker.serial_at_command(valid, timeout_ms=100)
+        self.assertTrue(result["ok"])
+        self.assertEqual(b"".join(instances[-1].writes), (valid + "\r\n").encode("ascii"))
+        self.assertEqual(sum(map(len, instances[-1].writes)), AT_MAX_FRAME_BYTES)
+
+        too_long = valid + "A"
+        with self.assertRaisesRegex(SerialError, "61 bytes"):
+            worker.serial_at_command(too_long)
+        self.assertEqual(len(instances), 1, "oversized frame must be rejected before opening serial port")
+
+    def test_historical_setdev_example_is_rejected_without_transmit(self):
+        worker, instances = self.make_worker(allow_writes=True)
+        command = "AT+SETDEV=2,0,0,0.000000,0.000000,1.000000,0.000000,1,795110505"
+        self.assertGreater(len(command), AT_MAX_TEXT_BYTES)
+        result = serial_tool_result(worker.serial_at_command, command)
+        self.assertFalse(result["ok"])
+        self.assertIn("61 bytes", result["error"])
+        self.assertEqual(instances, [])
+
+    def test_at_transmission_is_byte_paced_with_flush(self):
+        from serial_core import SerialWorker
+        class TrackingSerial(FakeSerial):
+            def __init__(self):
+                super().__init__()
+                self.flush_count = 0
+            def flush(self):
+                self.flush_count += 1
+
+        conn = TrackingSerial()
+        with patch("serial_core.time.sleep") as pause:
+            sent = SerialWorker._write_at_paced(conn, b"AT\r\n")
+        self.assertEqual(sent, 4)
+        self.assertEqual(conn.writes, [b"A", b"T", b"\r", b"\n"])
+        self.assertEqual(conn.flush_count, 4)
+        self.assertEqual(pause.call_count, 3)
+        pause.assert_any_call(AT_INTER_BYTE_SECONDS)
+        self.assertEqual([c.args for c in pause.call_args_list],
+                         [(AT_INTER_BYTE_SECONDS,)] * 3)
 
     def test_terminal_error_is_not_success(self):
         worker, _ = self.make_worker(reply=b"\r\nERROR\r\n")
@@ -198,6 +261,23 @@ class SerialCoreTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("busy", result["error"])
         self.assertNotIn("transmitted", result)
+
+    def test_default_allowlist_contains_both_usb_and_acm_ports(self):
+        with patch.dict("os.environ", {"RPI5_SERIAL_PORTS": ""}):
+            # An explicitly empty override is invalid; the default applies only if unset.
+            with self.assertRaises(SerialError):
+                SerialWorker()
+        with patch.dict("os.environ", {}, clear=True):
+            worker = SerialWorker(lister=lambda: [])
+            self.assertEqual(worker.ports, ("/dev/ttyUSB0", "/dev/ttyACM0"))
+            self.assertEqual(
+                [entry["port"] for entry in worker.serial_list_ports()["allowed"]],
+                ["/dev/ttyUSB0", "/dev/ttyACM0"],
+            )
+
+    def test_explicit_port_override_is_preserved(self):
+        with patch.dict("os.environ", {"RPI5_SERIAL_PORTS": "/dev/ttyACM0"}):
+            self.assertEqual(SerialWorker(lister=lambda: []).ports, ("/dev/ttyACM0",))
 
     def test_list_exposes_only_configured(self):
         worker, _ = self.make_worker()

@@ -34,6 +34,16 @@ class WorkerTests(unittest.TestCase):
         self.worker.close()
         self.tmp.cleanup()
 
+    def test_close_is_idempotent_and_releases_owned_gdb_once(self):
+        # The explicit server finally block and the atexit fallback both
+        # call close(); the worker must not terminate OpenOCD twice.
+        with patch.object(self.worker, "stop_gdb_server",
+                          return_value={"ok": True, "stopped": False}) as stop:
+            self.worker.close()
+            self.worker.close()
+        stop.assert_called_once_with()
+        self.assertTrue(self.worker._closed)
+
     def test_speed_limits(self):
         self.assertEqual(validate_speed(100), 100)
         for n in (0, 9, 5001, '100', True):
@@ -169,6 +179,29 @@ class WorkerTests(unittest.TestCase):
         stopped = self.worker.stop_gdb_server()
         self.assertTrue(stopped['stopped'])
         self.assertFalse(self.worker.server_status()['running'])
+
+    def test_flash_snapshot_routes_to_bounded_store(self):
+        with patch.object(self.worker.flash_snapshots, "capture",
+                          return_value={"ok": True, "resumed": True}) as capture:
+            result = self.worker.flash_snapshot(speed_khz=1000, label="stock-baseline")
+        self.assertTrue(result["ok"])
+        args, kwargs = capture.call_args
+        self.assertIn("interface/cmsis-dap.cfg", args[0])
+        self.assertIn("target/stm32f1x.cfg", args[0])
+        self.assertIn("adapter speed 1000", args[0])
+        self.assertEqual(args[2], "stock-baseline")
+
+    def test_flash_snapshot_refuses_managed_gdb_probe_contention(self):
+        fake_proc = type("FakeProc", (), {"poll": lambda self: None, "pid": 1337})()
+        self.worker._process = fake_proc
+        try:
+            with patch.object(self.worker.flash_snapshots, "capture") as capture:
+                result = self.worker.flash_snapshot()
+            self.assertFalse(result["ok"])
+            self.assertIn("GDB server owns", result["error"])
+            capture.assert_not_called()
+        finally:
+            self.worker._process = None
 
     def test_refuse_one_shot_during_gdb(self):
         fake_proc = type('FakeProc', (), {'poll': lambda self: None, 'pid': 1337})()

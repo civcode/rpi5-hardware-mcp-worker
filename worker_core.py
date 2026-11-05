@@ -19,6 +19,9 @@ import threading
 import time
 import uuid
 
+from flash_snapshots import FlashSnapshotStore
+from gdb_local import LocalGDB
+
 
 FLASH_START = 0x08000000
 FLASH_LIMIT = FLASH_START + 128 * 1024
@@ -128,11 +131,23 @@ class OpenOCDWorker:
         self._log_handle = None
         self._port = 3333
         self._images: dict[str, dict] = {}
+        self.flash_snapshots = FlashSnapshotStore()
+        self._gdb_client = LocalGDB()
+        self._closed = False
 
     def close(self) -> None:
-        self.stop_gdb_server()
-        if self._owns_workspace:
-            shutil.rmtree(self.workspace, ignore_errors=True)
+        """Stop owned GDB/OpenOCD, then release transient workspace once.
+
+        Safe to invoke both in the explicit server shutdown and at interpreter
+        exit. Persistent flash snapshots are deliberately retained.
+        """
+        with self._lock:
+            if self._closed:
+                return
+            self.stop_gdb_server()
+            if self._owns_workspace:
+                shutil.rmtree(self.workspace, ignore_errors=True)
+            self._closed = True
 
     def _args(self, speed_khz: int, quirk: bool = False) -> list[str]:
         validate_speed(speed_khz)
@@ -221,6 +236,43 @@ class OpenOCDWorker:
                     result["scripts"].append({"path": str(path), "error": str(exc)})
         return result
 
+
+    def flash_snapshot(self, speed_khz: int = 1000, label: str = "",
+                       quirk: bool = False) -> dict:
+        """Dump detected 64/128 KiB main flash without programming or resetting.
+
+        Temporarily halts MCU, then attempts explicit resume even on read error.
+        Never shares the probe with a worker-managed OpenOCD GDB server.
+        """
+        validate_speed(speed_khz)
+        with self._lock:
+            if self._server_running():
+                return {"ok": False, "error": "GDB server owns the probe. Stop it before taking a snapshot."}
+            return self.flash_snapshots.capture(self._args(speed_khz, quirk), self.workspace, label)
+
+    def flash_snapshot_info(self, snapshot_id: str) -> dict:
+        """Check persistent snapshot hash and metadata; host-only."""
+        return self.flash_snapshots.info(snapshot_id)
+
+    def flash_snapshot_list(self) -> dict:
+        """List persistent snapshot IDs, sizes and hashes; host-only."""
+        return self.flash_snapshots.list_snapshots()
+
+    def flash_snapshot_chunk(self, snapshot_id: str, offset: int = 0,
+                             length: int = 4096) -> dict:
+        """Return a hash-checked, bounded Base64 segment; host-only."""
+        return self.flash_snapshots.chunk(snapshot_id, offset, length)
+
+    def flash_snapshot_diff(self, before_id: str, after_id: str,
+                            label: str = "") -> dict:
+        """Diff two saved images offline and write complete JSON/CSV reports."""
+        return self.flash_snapshots.diff(before_id, after_id, label)
+
+    def flash_snapshot_diff_chunk(self, diff_id: str, format: str = "csv",
+                                  offset: int = 0, length: int = 4096) -> dict:
+        """Return a bounded saved diff-report fragment, without touching target."""
+        return self.flash_snapshots.diff_chunk(diff_id, format, offset, length)
+
     def probe_target(self, speed_khz: int = 100, quirk: bool = False) -> dict:
         commands = ["init", "halt", "targets", "mdw 0xE0042000 1", "mdh 0x1FFFF7E0 1",
                     "flash probe 0", "flash info 0", "shutdown"]
@@ -234,6 +286,14 @@ class OpenOCDWorker:
                     "mdw 0xE000ED34 1", "mdw 0xE000ED38 1", "shutdown"]
         return self._one_shot(speed_khz, commands, timeout=30, quirk=quirk)
 
+    def gdb_command(self, command: str, timeout_seconds: int = 30) -> dict:
+        """Send a command to the owned, persistent local GDB process."""
+        with self._lock:
+            if not self._server_running():
+                self._gdb_client.close()
+                return {"ok": False, "error": "OpenOCD server unavailable; start_gdb_server is required"}
+            return self._gdb_client.command(command, self._port, timeout_seconds)
+
     def start_gdb_server(self, speed_khz: int = 100, port: int = 3333, quirk: bool = False) -> dict:
         validate_speed(speed_khz)
         if type(port) is not int or not 1024 <= port <= 65535:
@@ -241,6 +301,7 @@ class OpenOCDWorker:
         with self._lock:
             if self._server_running():
                 return {"ok": True, "already_running": True, **self.server_status()}
+            self._gdb_client.close()
             self._port = port
             log_path = self.workspace / "openocd-gdb.log"
             self._log_handle = log_path.open("ab")
@@ -280,11 +341,13 @@ class OpenOCDWorker:
                 with log_path.open("rb") as f:
                     f.seek(max(0, log_path.stat().st_size - MAX_LOG_CHARS))
                     tail = f.read().decode("utf-8", errors="replace")
-            return {"running": running, "gdb_port": self._port, "gdb_host": socket.gethostname(),
+            return {"running": running, "local_gdb_running": self._gdb_client.running(),
+                    "gdb_port": self._port, "gdb_host": socket.gethostname(),
                     "pid": self._process.pid if self._process else None, "recent_log": tail[-5000:]}
 
     def stop_gdb_server(self) -> dict:
         with self._lock:
+            self._gdb_client.close()
             proc = self._process
             if proc is None:
                 return {"ok": True, "stopped": False}
