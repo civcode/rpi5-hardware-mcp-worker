@@ -262,6 +262,23 @@ class SerialCoreTests(unittest.TestCase):
         self.assertIn("busy", result["error"])
         self.assertNotIn("transmitted", result)
 
+    def test_default_allowlist_contains_both_usb_and_acm_ports(self):
+        with patch.dict("os.environ", {"RPI5_SERIAL_PORTS": ""}):
+            # An explicitly empty override is invalid; the default applies only if unset.
+            with self.assertRaises(SerialError):
+                SerialWorker()
+        with patch.dict("os.environ", {}, clear=True):
+            worker = SerialWorker(lister=lambda: [])
+            self.assertEqual(worker.ports, ("/dev/ttyUSB0", "/dev/ttyACM0"))
+            self.assertEqual(
+                [entry["port"] for entry in worker.serial_list_ports()["allowed"]],
+                ["/dev/ttyUSB0", "/dev/ttyACM0"],
+            )
+
+    def test_explicit_port_override_is_preserved(self):
+        with patch.dict("os.environ", {"RPI5_SERIAL_PORTS": "/dev/ttyACM0"}):
+            self.assertEqual(SerialWorker(lister=lambda: []).ports, ("/dev/ttyACM0",))
+
     def test_list_exposes_only_configured(self):
         worker, _ = self.make_worker()
         result = worker.serial_list_ports()

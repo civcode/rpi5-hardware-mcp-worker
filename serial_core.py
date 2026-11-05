@@ -70,7 +70,7 @@ class SerialWorker:
 
     def __init__(self, ports: tuple[str, ...] | None = None, allow_writes: bool = False,
                  factory: Callable | None = None, lister: Callable | None = None):
-        self.ports = ports if ports is not None else _allowed_ports(os.getenv("RPI5_SERIAL_PORTS", "/dev/ttyUSB0"))
+        self.ports = ports if ports is not None else _allowed_ports(os.getenv("RPI5_SERIAL_PORTS", "/dev/ttyUSB0,/dev/ttyACM0"))
         if not self.ports or tuple(dict.fromkeys(self.ports)) != _allowed_ports(",".join(self.ports)):
             raise SerialError("Invalid serial port configuration")
         self.allow_writes = allow_writes

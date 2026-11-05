@@ -1,6 +1,6 @@
 # Raspberry Pi 5 hardware MCP worker
 
-A **plain-LAN-HTTP** Model Context Protocol worker for Raspberry Pi 5 hardware access: OpenOCD/SWD through the Raspberry Pi Debug Probe and USB-UART/AT commands (default `/dev/ttyUSB0`) for the STM32F103 BU03/BU04 UWB kit.
+A **plain-LAN-HTTP** Model Context Protocol worker for Raspberry Pi 5 hardware access: OpenOCD/SWD through the Raspberry Pi Debug Probe and USB-UART/AT commands (default allowed ports `/dev/ttyUSB0` and `/dev/ttyACM0`) for the STM32F103 BU03/BU04 UWB kit.
 
 This is **not** a replacement for GDB or OpenOCD. The worker runs OpenOCD **on the Pi**, offers a few Pi coding agent tools, and starts/stops an OpenOCD **GDB TCP server on port 3333**. GDB on the Oberon workstation can connect directly to `edge.local:3333` and use the **local ATfE ELF with symbols**. It does not require SSH, TLS, a service manager, or a checkout of the SDK on the Pi. UART uses `pyserial` and shares the existing MCP endpoint.
 
@@ -132,7 +132,7 @@ On a command timeout the client session is closed and the target state is unknow
 The UART tools use the existing plain-HTTP endpoint `http://edge.local:8766/mcp`. Network listeners remain unchanged (`0.0.0.0:8766`; GDB port 3333 when started). No authentication, TLS, or firewall changes are introduced.
 
 - Install dependencies in the Pi virtual environment: `.venv/bin/python -m pip install -r requirements.txt`; this includes `pyserial`.
-- Default serial port: `/dev/ttyUSB0`. Configure additional permitted device paths with `RPI5_SERIAL_PORTS=/dev/ttyUSB0,/dev/serial/by-id/your-adapter`. An empty `port` argument selects the first configured path.
+- Default allowed serial ports: `/dev/ttyUSB0`, `/dev/ttyACM0` (in that order). Configure an explicit replacement allowlist with `RPI5_SERIAL_PORTS=/dev/ttyUSB0,/dev/ttyACM0,/dev/serial/by-id/your-adapter`. An empty `port` argument selects the first configured path. Environment overrides replace the defaults and must explicitly include `/dev/ttyACM0` if required.
 - Default UART: **115200 baud, 8N1**, no software or hardware flow control. Calls use finite timeouts, at most **4096 received bytes** and at most **256 transmitted bytes**.
 - `serial_list_ports()` reports presence and USB identifiers. `serial_capture(duration_ms=1000)` listens for unsolicited traffic without transmitting bytes.
 - `serial_at_query(command="AT+GETVER")` transmits `AT+GETVER\r\n` and returns `rx_base64`, `rx_hex`, `rx_gb18030`, `status` (`OK`, `ERROR`, or `INCOMPLETE`) and `complete`. Read-only allowlist: `AT`, `AT+GETVER`, `AT+GETCFG`, `AT+GETDEV`, `AT+GETUWBMODE`, `AT+PDOAGETCFG`, `AT+GETDLIST`, `AT+GETKLIST`. The quiet-window check refuses to transmit when unsolicited bytes are already present; use `serial_capture` to diagnose chatty firmware.
