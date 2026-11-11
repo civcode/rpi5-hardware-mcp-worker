@@ -180,6 +180,63 @@ class WorkerTests(unittest.TestCase):
         self.assertTrue(stopped['stopped'])
         self.assertFalse(self.worker.server_status()['running'])
 
+    def test_chunked_upload_integrates_with_legacy_staged_artifacts(self):
+        image = good_hex()
+        sha = hashlib.sha256(image).hexdigest()
+        upload = self.worker.begin_firmware_upload(len(image), sha)
+        upload_id = upload["upload_id"]
+        self.assertEqual(upload["max_chunk_bytes"], 8192)
+        first = image[:15]
+        second = image[15:]
+        self.worker.upload_firmware_chunk(upload_id, 0, base64.b64encode(first).decode())
+        self.worker.upload_firmware_chunk(upload_id, len(first), base64.b64encode(second).decode())
+        result = self.worker.finalize_firmware_upload(upload_id)
+        self.assertEqual(result["sha256"], sha)
+        self.assertEqual(result["uploaded_bytes"], len(image))
+        self.assertTrue(self.worker.staged_hex_info(result["artifact_id"])["ok"])
+        plan = self.worker.flash_preflight(result["artifact_id"])
+        self.assertTrue(plan["ready_for_flash_request"])
+        self.assertEqual(plan["target_flash_kib"], None)
+        self.assertFalse(plan["target_access"])
+        self.assertEqual(plan["capacity_status"], "NOT_PROBED_HOST_ONLY")
+
+    def test_host_only_preflight_blocks_protected_nvm_without_probe(self):
+        # One data byte in application, another in protected config at 0x08013800.
+        image = (record(4, 0, b"\\x08\\x00") + record(0, 0, b"\\x10") +
+                 record(4, 0, b"\\x08\\x01") + record(0, 0x3800, b"\\x20") +
+                 record(1, 0)).encode()
+        stage = self.worker.stage_hex(base64.b64encode(image).decode())
+        with patch.object(self.worker, "_one_shot") as openocd:
+            plan = self.worker.flash_preflight(stage["artifact_id"])
+            self.assertTrue(plan["protected_overlap"])
+            self.assertFalse(plan["ready_for_flash_request"])
+            result = self.worker.flash_hex(stage["artifact_id"], stage["sha256"], confirm="FLASH")
+            self.assertFalse(result["ok"])
+            openocd.assert_not_called()
+
+    def test_flash_preparation_explicit_reset_halt(self):
+        stage = self.worker.stage_hex(base64.b64encode(good_hex()).decode())
+        with patch.object(self.worker, "probe_target", return_value={"ok": True, "flash_kib": 128}):
+            with patch.object(self.worker, "_one_shot", return_value={"ok": True}) as run:
+                self.assertTrue(self.worker.flash_hex(stage["artifact_id"], stage["sha256"], confirm="FLASH")["ok"])
+        command = run.call_args.args[1][0]
+        self.assertIn("init; reset halt; program {", command)
+        self.assertIn("verify reset exit", command)
+
+    def test_missing_eof_has_actionable_code(self):
+        with self.assertRaises(WorkerError) as failure:
+            inspect_intel_hex(good_hex().replace(b":00000001FF\\n", b""))
+        self.assertEqual(failure.exception.code, "HEX_MISSING_EOF")
+
+    def test_wrong_host_gdb_path_rejected_before_sending(self):
+        from worker_core import pi_gdb_file_error
+        result = pi_gdb_file_error("file /tmp/oberon-only-project.elf")
+        self.assertEqual(result["error"]["code"], "GDB_FILE_NOT_ON_PI")
+        self.assertIn("Raspberry Pi", result["error"]["message"])
+        self.assertIsNone(pi_gdb_file_error("monitor reset halt"))
+        with tempfile.NamedTemporaryFile(suffix=".elf") as tmp:
+            self.assertIsNone(pi_gdb_file_error("file " + tmp.name))
+
     def test_flash_snapshot_routes_to_bounded_store(self):
         with patch.object(self.worker.flash_snapshots, "capture",
                           return_value={"ok": True, "resumed": True}) as capture:
