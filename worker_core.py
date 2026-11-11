@@ -11,6 +11,7 @@ import hashlib
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -115,6 +116,32 @@ def inspect_intel_hex(contents: bytes) -> dict:
         "max_flash_kib_needed": (max_exclusive - FLASH_START + 1023) // 1024,
         "data_bytes": total,
     }
+
+
+def pi_gdb_file_error(command: str) -> dict | None:
+    """Explain wrong-host file paths before GDB/OpenOCD attempts filesystem I/O.
+
+    Covers ordinary GDB console commands. More complex MI commands are
+    intentionally not rewritten or executed as filesystem operations here.
+    """
+    try:
+        fields = shlex.split(command)
+    except ValueError:
+        return None
+    if not fields:
+        return None
+    filename = None
+    if fields[0] in ("file", "exec-file", "symbol-file", "add-symbol-file", "load") and len(fields) >= 2:
+        filename = fields[1]
+    elif fields[:3] == ["monitor", "flash", "write_image"] and len(fields) >= 5:
+        filename = fields[4] if fields[3] in ("erase", "unlock", "erase_unlock") else fields[3]
+    elif fields[:2] == ["monitor", "verify_image"] and len(fields) >= 3:
+        filename = fields[2]
+    if filename and not Path(filename).is_file():
+        return {"ok": False, "error": {"code": "GDB_FILE_NOT_ON_PI",
+                "message": "This MCP GDB/OpenOCD process runs on the Raspberry Pi; file does not exist there",
+                "details": {"path": filename, "hint": "Stage the file on the Pi, or run GDB on Oberon against the Pi OpenOCD server."}}}
+    return None
 
 
 def parse_flash_kib(probe_output: str) -> int | None:
@@ -301,6 +328,9 @@ class OpenOCDWorker:
             if not self._server_running():
                 self._gdb_client.close()
                 return {"ok": False, "error": "OpenOCD server unavailable; start_gdb_server is required"}
+            wrong_host = pi_gdb_file_error(command)
+            if wrong_host:
+                return wrong_host
             return self._gdb_client.command(command, self._port, timeout_seconds)
 
     def start_gdb_server(self, speed_khz: int = 100, port: int = 3333, quirk: bool = False) -> dict:
@@ -409,6 +439,9 @@ class OpenOCDWorker:
             except OSError as exc:
                 return {"ok": False, "error": {"code": "ARTIFACT_READ_FAILED", "message": str(exc)}}
             digest = hashlib.sha256(contents).hexdigest()
+            if not re.fullmatch(r"/[A-Za-z0-9_./-]+", str(image["path"])):
+                return {"ok": False, "error": {"code": "STAGED_PATH_UNSAFE",
+                        "message": "Pi workspace path is unsafe for the OpenOCD command syntax"}}
             if digest != image["digest"]:
                 return {"ok": False, "error": {"code": "ARTIFACT_CHANGED",
                         "message": "Staged image SHA-256 changed; refuse flash"}}
