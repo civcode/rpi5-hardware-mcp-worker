@@ -202,8 +202,8 @@ class WorkerTests(unittest.TestCase):
 
     def test_host_only_preflight_blocks_protected_nvm_without_probe(self):
         # One data byte in application, another in protected config at 0x08013800.
-        image = (record(4, 0, b"\\x08\\x00") + record(0, 0, b"\\x10") +
-                 record(4, 0, b"\\x08\\x01") + record(0, 0x3800, b"\\x20") +
+        image = (record(4, 0, b"\x08\x00") + record(0, 0, b"\x10") +
+                 record(4, 0, b"\x08\x01") + record(0, 0x3800, b"\x20") +
                  record(1, 0)).encode()
         stage = self.worker.stage_hex(base64.b64encode(image).decode())
         with patch.object(self.worker, "_one_shot") as openocd:
@@ -224,8 +224,9 @@ class WorkerTests(unittest.TestCase):
         self.assertIn("verify reset exit", command)
 
     def test_missing_eof_has_actionable_code(self):
-        with self.assertRaises(WorkerError) as failure:
-            inspect_intel_hex(good_hex().replace(b":00000001FF\\n", b""))
+        from firmware_upload import UploadError
+        with self.assertRaises(UploadError) as failure:
+            inspect_intel_hex(good_hex().replace(b":00000001FF\n", b""))
         self.assertEqual(failure.exception.code, "HEX_MISSING_EOF")
 
     def test_wrong_host_gdb_path_rejected_before_sending(self):
