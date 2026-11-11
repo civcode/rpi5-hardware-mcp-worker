@@ -97,7 +97,7 @@ The Raspberry Pi 5 is named `edge`; use its LAN/mDNS hostname `edge.local`, or i
 | `gdb_server_status` | Report server state, PID and recent OpenOCD logs |
 | `gdb_command` | Persistent GDB console/MI command transport; no token required |
 | `stop_gdb_server` | Stop persistent OpenOCD process |
-| `stage_hex` | Stage an Intel HEX image sent as base64; checks checksums, address range and SHA-256; **does not flash** |
+| `begin_firmware_upload` | Create host-only bounded chunked upload; original byte count and SHA-256 required |\n| `upload_firmware_chunk` | Transfer 1–8192 original bytes as Base64 at an exact byte offset; identical retry safe |\n| `finalize_firmware_upload` / `abort_firmware_upload` | Validate complete HEX and stage an artifact, or abort partial upload; no target access |\n| `flash_preflight` | Rehash staged artifact and check protected flash/config boundary plus probe ownership; host-only, capacity probe deferred |\n| `stage_hex` | Stage an Intel HEX image sent as base64; checks checksums, address range and SHA-256; **does not flash** |
 | `staged_hex_info` | Rehash a staged HEX and return its generated OpenOCD path; **does not access the target** |
 | `flash_hex` | Destructive: probe capacity, **erase/program/verify/reset** a staged image, only with matching SHA-256 plus `confirm="FLASH"` |
 | `serial_list_ports` | List configured USB serial devices and presence |
@@ -112,7 +112,9 @@ The Raspberry Pi 5 is named `edge`; use its LAN/mDNS hostname `edge.local`, or i
 
 The optional `quirk=true` parameter requests OpenOCD CMSIS-DAP single-packet compatibility mode (if supported by installed OpenOCD). `speed_khz` defaults to **100** to debug unreliable links. Official probe firmware v2.3.1 or v2.2.3 may be useful as a comparison when diagnosing Pi 5-specific issues.
 
-**Flash normally via GDB `load` instead of passing a large HEX through MCP**: it works directly with the ELF on Oberon, retains debug symbols, and avoids a file transfer. `stage_hex`/`flash_hex` are optional for agent-controlled program/verify tests and perform capacity/hash checks.
+**Firmware upload for agents:** use `begin_firmware_upload` → `upload_firmware_chunk` (Base64 pieces up to 8192 original bytes, byte offsets) → `finalize_firmware_upload` → `flash_preflight`. These steps are **host-only**, do not halt the STM32 and do not program flash. Only a separate, explicitly confirmed `flash_hex` operation can erase/program/reset after verifying staged SHA-256, protected image boundary and actual factory flash capacity. The former single-shot `stage_hex` remains for compatibility but is not recommended for 200-KB+ HEX through agent tool calls. See [AGENT_FIRMWARE_WORKFLOW.md](AGENT_FIRMWARE_WORKFLOW.md) for exact multi-host instructions, error codes and failure recovery.
+
+**GDB alternative:** run GDB **on Oberon** with the local `Project.elf` and connect to OpenOCD **on the Pi**, then `load` only with flash authorization. The MCP `gdb_command` tool instead runs GDB **on the Pi**; it cannot open Oberon-local worktree paths. An OpenOCD `monitor flash write_image` filename likewise resolves on the Pi. Do not mix these workflows.
 
 ### MCP GDB command transport
 
