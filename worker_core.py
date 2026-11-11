@@ -165,6 +165,7 @@ class OpenOCDWorker:
         self._log_handle = None
         self._port = 3333
         self._images: dict[str, dict] = {}
+        self._last_probe_flash_kib: int | None = None  # informational, never a flash authorization
         self._upload_manager = FirmwareUploadManager(self.workspace, inspect_intel_hex, MAX_HEX_BYTES)
         self.flash_snapshots = FlashSnapshotStore()
         self._gdb_client = LocalGDB()
@@ -315,6 +316,9 @@ class OpenOCDWorker:
         result = self._one_shot(speed_khz, commands, timeout=30, quirk=quirk)
         if result.get("ok"):
             result["flash_kib"] = parse_flash_kib(result["output"])
+            if result["flash_kib"] is not None:
+                with self._lock:
+                    self._last_probe_flash_kib = result["flash_kib"]
         return result
 
     def fault_snapshot(self, speed_khz: int = 100, quirk: bool = False) -> dict:
@@ -463,9 +467,12 @@ class OpenOCDWorker:
                                      "end_exclusive": f"0x{FLASH_LIMIT:08x}"},
                 "protected_overlap": protected_overlap,
                 "gdb_server_owns_probe": server_busy,
-                "target_flash_kib": None,
-                "capacity_status": "NOT_PROBED_HOST_ONLY",
-                "capacity_note": "Actual factory flash size is verified by flash_hex before programming.",
+                "target_flash_kib": self._last_probe_flash_kib,
+                "capacity_status": ("CACHED_PREVIOUS_PROBE_RECHECK_AT_FLASH"
+                                    if self._last_probe_flash_kib is not None
+                                    else "NOT_PROBED_HOST_ONLY"),
+                "capacity_note": ("This is a previous probe result, not a fresh hardware check. "
+                                  "flash_hex re-probes factory capacity before programming."),
                 "will_reset_halt_before_programming": True,
                 "ready_for_flash_request": not reasons,
                 "blocking_reasons": reasons,
