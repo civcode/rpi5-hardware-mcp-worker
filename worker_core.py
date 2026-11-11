@@ -19,12 +19,15 @@ import threading
 import time
 import uuid
 
+from firmware_upload import FirmwareUploadManager, UploadError
 from flash_snapshots import FlashSnapshotStore
 from gdb_local import LocalGDB
 
 
 FLASH_START = 0x08000000
 FLASH_LIMIT = FLASH_START + 128 * 1024
+# ATfE application must not overwrite original NVM/configuration at 0x08013800.
+APP_FLASH_LIMIT = 0x08013800
 MAX_HEX_BYTES = 2 * 1024 * 1024
 MAX_LOG_CHARS = 20_000
 # Fixed allowlist: this host-only diagnostic never invokes OpenOCD's init.
@@ -99,8 +102,12 @@ def inspect_intel_hex(contents: bytes) -> dict:
                 raise WorkerError(f"Invalid start-address record (line {idx})")
         else:
             raise WorkerError(f"Unsupported record type {kind} (line {idx})")
-    if not saw_eof or total <= 0 or min_addr is None or max_exclusive is None:
-        raise WorkerError("HEX file has no data or is missing EOF")
+    if not saw_eof:
+        raise UploadError("HEX_MISSING_EOF", "HEX file is missing the final EOF record :00000001FF",
+                          decoded_bytes=len(contents))
+    if total <= 0 or min_addr is None or max_exclusive is None:
+        raise UploadError("HEX_NO_DATA", "HEX file contains no flash data records",
+                          decoded_bytes=len(contents))
     if min_addr != FLASH_START:
         raise WorkerError("HEX image must begin at STM32 flash base 0x08000000")
     return {
@@ -131,6 +138,7 @@ class OpenOCDWorker:
         self._log_handle = None
         self._port = 3333
         self._images: dict[str, dict] = {}
+        self._upload_manager = FirmwareUploadManager(self.workspace, inspect_intel_hex, MAX_HEX_BYTES)
         self.flash_snapshots = FlashSnapshotStore()
         self._gdb_client = LocalGDB()
         self._closed = False
@@ -145,6 +153,7 @@ class OpenOCDWorker:
             if self._closed:
                 return
             self.stop_gdb_server()
+            self._upload_manager.close()
             if self._owns_workspace:
                 shutil.rmtree(self.workspace, ignore_errors=True)
             self._closed = True
@@ -361,6 +370,75 @@ class OpenOCDWorker:
             self._process = None
             return {"ok": True, "stopped": True, "exit_code": proc.returncode}
 
+    def begin_firmware_upload(self, total_bytes: int, expected_sha256: str) -> dict:
+        """Create a bounded, host-only transfer session; does not touch target."""
+        return self._upload_manager.begin(total_bytes, expected_sha256)
+
+    def upload_firmware_chunk(self, upload_id: str, offset: int, chunk_base64: str) -> dict:
+        """Write at most 8192 decoded bytes to the Pi workspace, in byte order."""
+        return self._upload_manager.chunk(upload_id, offset, chunk_base64)
+
+    def finalize_firmware_upload(self, upload_id: str) -> dict:
+        """Require exact length, SHA-256 and valid flash-range Intel HEX before staging."""
+        result = self._upload_manager.finalize(upload_id)
+        with self._lock:
+            self._images[result["artifact_id"]] = {
+                "path": result["path"], "digest": result["sha256"],
+                "start": result["start"], "end_exclusive": result["end_exclusive"],
+                "data_bytes": result["data_bytes"],
+                "max_flash_kib_needed": result["max_flash_kib_needed"],
+            }
+        return {key: value for key, value in result.items() if key != "path"}
+
+    def abort_firmware_upload(self, upload_id: str) -> dict:
+        """Cancel a partial upload and remove its temporary file; never touches target."""
+        return self._upload_manager.abort(upload_id)
+
+    def flash_preflight(self, artifact_id: str) -> dict:
+        """Non-disruptive host-only flash plan; hardware capacity checked during flash_hex.
+
+        Does not reset, halt, resume, attach OpenOCD or transmit UART data.
+        """
+        with self._lock:
+            image = self._images.get(artifact_id)
+            if image is None:
+                return {"ok": False, "error": {"code": "ARTIFACT_UNKNOWN",
+                        "message": "Unknown staged image; stage it again after worker restart"}}
+            try:
+                contents = image["path"].read_bytes()
+            except OSError as exc:
+                return {"ok": False, "error": {"code": "ARTIFACT_READ_FAILED", "message": str(exc)}}
+            digest = hashlib.sha256(contents).hexdigest()
+            if digest != image["digest"]:
+                return {"ok": False, "error": {"code": "ARTIFACT_CHANGED",
+                        "message": "Staged image SHA-256 changed; refuse flash"}}
+            info = inspect_intel_hex(contents)
+            end = int(info["end_exclusive"], 16)
+            protected_overlap = end > APP_FLASH_LIMIT
+            server_busy = self._server_running()
+            reasons = []
+            if protected_overlap:
+                reasons.append("IMAGE_OVERLAPS_PROTECTED_FLASH")
+            if server_busy:
+                reasons.append("GDB_SERVER_OWNS_PROBE")
+            return {
+                "ok": True, "artifact_id": artifact_id, "sha256": digest,
+                "uploaded_bytes": len(contents), "data_bytes": info["data_bytes"],
+                "start": info["start"], "end_exclusive": info["end_exclusive"],
+                "required_flash_kib": info["max_flash_kib_needed"],
+                "protected_region": {"start": f"0x{APP_FLASH_LIMIT:08x}",
+                                     "end_exclusive": f"0x{FLASH_LIMIT:08x}"},
+                "protected_overlap": protected_overlap,
+                "gdb_server_owns_probe": server_busy,
+                "target_flash_kib": None,
+                "capacity_status": "NOT_PROBED_HOST_ONLY",
+                "capacity_note": "Actual factory flash size is verified by flash_hex before programming.",
+                "will_reset_halt_before_programming": True,
+                "ready_for_flash_request": not reasons,
+                "blocking_reasons": reasons,
+                "target_access": False,
+            }
+
     def stage_hex(self, base64_hex: str, expected_sha256: str = "") -> dict:
         if len(base64_hex) > (MAX_HEX_BYTES * 4 // 3 + 16):
             raise WorkerError("Uploaded HEX too large")
@@ -368,6 +446,8 @@ class OpenOCDWorker:
             data = base64.b64decode(base64_hex, validate=True)
         except (ValueError, binascii.Error) as exc:
             raise WorkerError("Invalid base64 HEX") from exc
+        if not data:
+            raise UploadError("UPLOAD_EMPTY", "Base64 argument decoded to zero bytes; pass complete file contents, not a filename")
         info = inspect_intel_hex(data)
         digest = hashlib.sha256(data).hexdigest()
         if expected_sha256 and expected_sha256.lower() != digest:
@@ -407,9 +487,13 @@ class OpenOCDWorker:
         with self._lock:
             if self._server_running():
                 return {"ok": False, "error": "Stop GDB server before standalone flash. Alternatively use GDB 'load'."}
+            preflight = self.flash_preflight(artifact_id)
+            if not preflight.get("ok"):
+                return preflight
+            if not preflight["ready_for_flash_request"]:
+                return {"ok": False, "error": "Flash preflight blocked programming",
+                        "blocking_reasons": preflight["blocking_reasons"], "preflight": preflight}
             image = self._images.get(artifact_id)
-            if not image:
-                return {"ok": False, "error": "Unknown staged image"}
             if image["digest"] != confirm_sha256.lower():
                 return {"ok": False, "error": "SHA-256 confirmation does not match staged image"}
             if hashlib.sha256(image["path"].read_bytes()).hexdigest() != image["digest"]:
@@ -423,7 +507,9 @@ class OpenOCDWorker:
             if image["max_flash_kib_needed"] > cap:
                 return {"ok": False, "error": f"Image needs {image['max_flash_kib_needed']} KiB, target reports {cap} KiB"}
             # UUID file names are Tcl-safe; no interpolated user path or arbitrary commands.
-            cmd = ["program {" + image["path"].as_posix() + "} verify reset exit"]
+            # reset halt is required: the earlier H14 halt-only attempt faulted in
+            # OpenOCD's flash loader; the controlled reset-halt retry succeeded.
+            cmd = ["init; reset halt; program {" + image["path"].as_posix() + "} verify reset exit"]
             result = self._one_shot(speed_khz, cmd, timeout=180, quirk=quirk)
             result["target_flash_kib"] = cap
             result["sha256"] = image["digest"]
