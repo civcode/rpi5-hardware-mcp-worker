@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import atexit
+import logging
 import os
 
 from mcp.server import MCPServer
@@ -11,6 +12,28 @@ from firmware_upload import UploadError
 from flash_snapshots import snapshot_tool_result
 from worker_lifecycle import run_with_cleanup
 from serial_core import SerialWorker, serial_tool_result
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+class SessionTerminationTimestamp(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+
+        if message == "Terminating session: None":
+            timestamp = datetime.fromtimestamp(
+                record.created,
+                ZoneInfo("Europe/Vienna"),
+            ).isoformat(timespec="milliseconds")
+
+            record.msg = f"{timestamp} {message}"
+            record.args = ()
+
+        return True
+
+
+logging.getLogger("mcp.server.streamable_http").addFilter(
+    SessionTerminationTimestamp()
+)
 
 worker = OpenOCDWorker()
 serial_worker = SerialWorker(allow_writes=os.getenv("RPI5_SERIAL_ENABLE_WRITES") == "1")  # Raw serial_exchange only
