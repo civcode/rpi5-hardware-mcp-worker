@@ -253,6 +253,41 @@ class WorkerTests(unittest.TestCase):
             self.assertFalse(result["ok"])
             command.assert_called_once_with("monitor reset run", 3333, 30, "", require_existing=True)
 
+    def test_reset_success_requires_matching_probe_and_session(self):
+        before = {"openocd_running": True, "session_state": "active",
+                  "session_lost": False, "target_state": "unknown",
+                  "target_state_verified": False}
+        after = {**before, "target_state": "running", "target_state_verified": True}
+        with patch.object(self.worker, "_gdb_metadata", side_effect=[before, after]), \
+                patch.object(self.worker._gdb_client, "command", return_value={
+                    "ok": True, "result_class": "done", "state_probe": {"ok": True}}):
+            result = self.worker.target_reset("run", "RESET", "expected")
+            self.assertTrue(result["reset_command_accepted"], result)
+            self.assertTrue(result["requested_state_observed"], result)
+            self.assertTrue(result["ok"], result)
+        with patch.object(self.worker, "_gdb_metadata", return_value=after), \
+                patch.object(self.worker._gdb_client, "command", return_value={
+                    "ok": False, "error": "GDB session_id mismatch"}):
+            result = self.worker.target_reset("run", "RESET", "stale")
+            self.assertFalse(result["reset_command_accepted"])
+            self.assertFalse(result["requested_state_observed"])
+
+    def test_fingerprint_live_capture_preserves_resume_metadata(self):
+        from flash_snapshots import SnapshotError
+        with patch.object(self.worker, "flash_snapshot", return_value={
+                "ok": True, "snapshot_id": "a" * 32, "resumed": True, "flash_kib": 64}) as capture, \
+                patch.object(self.worker.flash_snapshots, "fingerprint") as fingerprint:
+            fingerprint.return_value = {"ok": True, "length": 65536}
+            result = self.worker.firmware_fingerprint(capture_live=True)
+            self.assertTrue(result["resumed"])
+            self.assertEqual(result["source"], "live_snapshot")
+            capture.assert_called_once_with(1000, "firmware-fingerprint", False)
+            fingerprint.side_effect = SnapshotError("capacity exceeded")
+            result = self.worker.firmware_fingerprint(capture_live=True, length=100000)
+            self.assertFalse(result["ok"])
+            self.assertTrue(result["resumed"])
+            self.assertEqual(result["snapshot_id"], "a" * 32)
+
     def test_fingerprint_preserves_probe_exclusivity_and_offline_path(self):
         fake_proc = type("FakeProc", (), {"poll": lambda self: None, "pid": 1337})()
         self.worker._process = fake_proc
