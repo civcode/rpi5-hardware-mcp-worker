@@ -21,14 +21,12 @@ import time
 import uuid
 
 from firmware_upload import FirmwareUploadManager, UploadError
-from flash_snapshots import FlashSnapshotStore
+from flash_snapshots import APP_FLASH_LIMIT, FlashSnapshotStore, SnapshotError
 from gdb_session import ManagedGDB
 
 
 FLASH_START = 0x08000000
 FLASH_LIMIT = FLASH_START + 128 * 1024
-# ATfE application must not overwrite original NVM/configuration at 0x08013800.
-APP_FLASH_LIMIT = 0x08013800
 MAX_HEX_BYTES = 2 * 1024 * 1024
 MAX_LOG_CHARS = 20_000
 # Fixed allowlist: this host-only diagnostic never invokes OpenOCD's init.
@@ -300,10 +298,22 @@ class OpenOCDWorker:
             if not result["ok"]:
                 return result
             snapshot_id = result["snapshot_id"]
-        fingerprint = self.flash_snapshots.fingerprint(snapshot_id, start_address, length,
-                                                       expected_sha256)
-        return {**fingerprint, "source": "live_snapshot" if capture_live else "saved_snapshot",
-                "capture_live": capture_live}
+        try:
+            fingerprint = self.flash_snapshots.fingerprint(snapshot_id, start_address, length,
+                                                           expected_sha256)
+        except (SnapshotError, OSError) as exc:
+            if not capture_live:
+                raise
+            # Preserve successful capture/resume evidence if the actual factory
+            # capacity makes the requested fingerprint range invalid.
+            return {"ok": False, "error": str(exc), "source": "live_snapshot",
+                    "snapshot_id": snapshot_id, "resumed": result.get("resumed"),
+                    "flash_kib": result.get("flash_kib")}
+        response = {**fingerprint, "source": "live_snapshot" if capture_live else "saved_snapshot",
+                    "capture_live": capture_live}
+        if capture_live:
+            response["resumed"] = result.get("resumed")
+        return response
 
     def flash_snapshot_info(self, snapshot_id: str) -> dict:
         """Check persistent snapshot hash and metadata; host-only."""
@@ -427,7 +437,8 @@ class OpenOCDWorker:
             result = {**result, **after,
                       "ok": result["ok"] and after["openocd_running"] and not after["session_lost"]}
             accepted = result.get("result_class") == "done"
-            observed = (result.get("target_state_verified") is True and
+            observed = (accepted and result.get("state_probe", {}).get("ok") is True and
+                        result.get("target_state_verified") is True and
                         result.get("target_state") == {"run": "running", "halt": "halted"}[mode] and
                         not result.get("session_lost"))
             response = {**metadata, **result, "requested_mode": mode,
