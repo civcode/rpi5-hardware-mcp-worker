@@ -109,12 +109,16 @@ class ManagedGDB(LocalGDB):
                         "GDB output closed" if self._eof else "GDB process exited")
                     self._exit_code = exit_code
                     self._observe("unknown", None)
+                if proc is not None and not alive:
+                    self._previous_pid = proc.pid
+                    self._exit_code = exit_code
                 active = self._phase == "active" and alive
                 return {
                     "session_id": self._session_id,
                     "session_state": self._phase,
                     "session_lost": self._phase == "lost",
                     "session_loss_reason": self._loss_reason,
+                    "dropped_lines": self._dropped,
                     "gdb_running": alive,
                     "gdb_pid": proc.pid if alive else None,
                     "last_gdb_pid": self._previous_pid,
@@ -126,7 +130,7 @@ class ManagedGDB(LocalGDB):
                     # an OpenOCD monitor command. Only a direct targets response
                     # qualifies as an OpenOCD observation (not a live guarantee).
                     "target_state_verified": active and self._source == "openocd_targets"
-                    and self._state != "unknown",
+                    and self._state in ("running", "halted", "reset", "debug-running"),
                     "session_recreated": False,
                 }
 
@@ -240,6 +244,9 @@ class ManagedGDB(LocalGDB):
             mi = command if command.startswith("-") else (
                 "-interpreter-exec console " + json.dumps(command, ensure_ascii=False))
             normalized = " ".join(command.strip().split()).lower()
+            if self.status()["session_lost"]:
+                return {"ok": False, "error": "GDB session lost before command; not sent",
+                        **self.status()}
             with self._event_lock:
                 # The arbitrary command language can change state. Do not
                 # promote stale observations to evidence for a new command.
