@@ -362,7 +362,10 @@ class OpenOCDWorker:
                 return {"ok": False, "error": "OpenOCD server unavailable; start_gdb_server is required",
                         **metadata}
             result = self._gdb_client.start(self._port)
-            return {**metadata, **result}
+            after = self._gdb_metadata()
+            if not after["openocd_running"] or after["session_lost"]:
+                return {**result, **after, "ok": False}
+            return {**after, **result}
 
     def gdb_session_status(self) -> dict:
         with self._lock:
@@ -391,7 +394,9 @@ class OpenOCDWorker:
             if not after["openocd_running"]:
                 return {**result, **after, "ok": False,
                         "error": "OpenOCD server lost during command; target state unknown"}
-            return {**metadata, **result}
+            return {**result, **after,
+                    "session_recreated": result.get("session_recreated", False),
+                    "ok": result["ok"] and not after["session_lost"]}
 
     def target_execution_status(self, refresh: bool = False) -> dict:
         with self._lock:
@@ -404,7 +409,7 @@ class OpenOCDWorker:
             after = self._gdb_metadata()
             if not after["openocd_running"]:
                 return {**result, **after, "ok": False, "error": "OpenOCD server lost"}
-            return {**metadata, **result}
+            return {**result, **after, "ok": result["ok"] and not after["session_lost"]}
 
     def target_reset(self, mode: str, confirm: str, session_id: str = "") -> dict:
         """Explicitly reset existing target session; distinguish acceptance from observation."""
@@ -419,8 +424,8 @@ class OpenOCDWorker:
             result = self._gdb_client.command("monitor reset " + mode, self._port, 30,
                                               session_id, require_existing=True)
             after = self._gdb_metadata()
-            if not after["openocd_running"]:
-                result = {**result, **after, "ok": False}
+            result = {**result, **after,
+                      "ok": result["ok"] and after["openocd_running"] and not after["session_lost"]}
             accepted = result.get("result_class") == "done"
             observed = (result.get("target_state_verified") is True and
                         result.get("target_state") == {"run": "running", "halt": "halted"}[mode] and
