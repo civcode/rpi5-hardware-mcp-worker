@@ -20,6 +20,8 @@ import uuid
 
 
 FLASH_START = 0x08000000
+# Project layout: application must not overlap original NVM/configuration.
+APP_FLASH_LIMIT = 0x08013800
 ALLOWED_FLASH_KIB = (64, 128)
 PAGE_BYTES = 1024
 _ID = re.compile(r"[0-9a-f]{32}\Z")
@@ -166,7 +168,7 @@ class FlashSnapshotStore:
         if (type(start_address) is not int or type(length) is not int or
                 not FLASH_START <= start_address < limit or
                 length < 0 or start_address + length > limit or
-                (length == 0 and start_address >= 0x08013800)):
+                (length == 0 and start_address >= APP_FLASH_LIMIT)):
             raise SnapshotError("Fingerprint range must fit main flash; length=0 selects application end")
         if not isinstance(expected_sha256, str) or (expected_sha256 and
                 not re.fullmatch(r"[0-9a-fA-F]{64}", expected_sha256)):
@@ -179,17 +181,18 @@ class FlashSnapshotStore:
         data, info = self._read(snapshot_id)
         offset = start_address - FLASH_START
         if length == 0:
-            length = min(len(data), 0x08013800 - FLASH_START) - offset
+            length = min(len(data), APP_FLASH_LIMIT - FLASH_START) - offset
         if length <= 0 or offset + length > len(data):
             raise SnapshotError("Fingerprint range exceeds captured factory flash capacity")
         digest = _sha(data[offset:offset + length])
         return {"ok": True, "snapshot_id": snapshot_id,
                 "captured_utc": info.get("captured_utc"), "flash_kib": info["flash_kib"],
+                "snapshot_resumed": info.get("resumed"),
                 "start_address": f"0x{start_address:08X}",
                 "end_exclusive": f"0x{start_address + length:08X}", "length": length,
                 "sha256": digest, "snapshot_sha256": info["sha256"],
                 "matches_expected": digest == expected_sha256.lower() if expected_sha256 else None,
-                "includes_protected_region": start_address + length > 0x08013800,
+                "includes_protected_region": start_address + length > APP_FLASH_LIMIT,
                 "note": "Compare binary bytes over exactly this address interval, not ELF/HEX file hashes."}
 
     def info(self, snapshot_id: str) -> dict:
