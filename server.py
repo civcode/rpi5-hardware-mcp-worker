@@ -141,12 +141,60 @@ def start_gdb_server(speed_khz: int = 100, port: int = 3333, quirk: bool = False
 
 
 @mcp.tool()
-def gdb_command(command: str, timeout_seconds: int = 30) -> dict:
-    """Forward to GDB RUNNING ON THE RASPBERRY PI, not Oberon.
-    File paths in GDB commands (file/load) MUST exist on the Pi filesystem;
-    Oberon worktree paths are NOT visible. For Oberon-local ELF use an Oberon
-    GDB client connecting to the Pi OpenOCD server instead. May halt or flash target."""
-    return worker.gdb_command(command, timeout_seconds)
+def gdb_session_start() -> dict:
+    """Explicitly attach a persistent Pi-local GDB client to owned OpenOCD; may halt MCU.
+    Required after session loss or explicit stop. Do not mix with an external GDB client."""
+    return worker.gdb_session_start()
+
+
+@mcp.tool()
+def gdb_session_status() -> dict:
+    """Host-only GDB identity, process health, and last observed target state; never attach."""
+    return worker.gdb_session_status()
+
+
+@mcp.tool()
+def gdb_session_stop() -> dict:
+    """Terminate only Pi-local GDB, leaving OpenOCD alive. No explicit halt/resume/reset;
+    OpenOCD disconnect handling may affect target execution."""
+    return worker.gdb_session_stop()
+
+
+@mcp.tool()
+def gdb_command(command: str, timeout_seconds: int = 30, session_id: str = "") -> dict:
+    """Forward CLI or native MI to Pi-local GDB; empty command polls output.
+    First call can attach; after loss/stop use gdb_session_start explicitly.
+    Pass returned session_id to reject stale-session commands. File paths must
+    exist on the Pi, not Oberon. Raw GDB commands may halt, reset or flash target."""
+    return worker.gdb_command(command, timeout_seconds, session_id)
+
+
+@mcp.tool()
+def target_execution_status(refresh: bool = False) -> dict:
+    """Report last observed execution state, or query monitor targets in an existing
+    GDB session when refresh=true. Never attach, halt or resume to obtain status.
+    A failed/unavailable observation is not proof of a running or halted MCU."""
+    return worker.target_execution_status(refresh)
+
+
+@mcp.tool()
+def target_reset(mode: str, confirm: str, session_id: str = "") -> dict:
+    """Explicit runtime reset: mode run/halt, confirm RESET. Requires existing session.
+    Returns command acceptance separately from observed requested state. Never programs flash."""
+    return worker.target_reset(mode, confirm, session_id)
+
+
+@mcp.tool()
+def firmware_fingerprint(snapshot_id: str = "", start_address: int = 0x08000000,
+                         length: int = 0, expected_sha256: str = "",
+                         capture_live: bool = False, speed_khz: int = 1000,
+                         quirk: bool = False) -> dict:
+    """SHA-256 over exact raw flash bytes; default application range ends at 0x08013800
+    or factory capacity, whichever is lower. Use a saved snapshot OR capture_live=true.
+    Live capture temporarily HALTS then RESUMES, and refuses if OpenOCD owns probe.
+    Never programs/resets flash. Optional expected hash compares the same address interval."""
+    return snapshot_tool_result(worker.firmware_fingerprint, snapshot_id, start_address,
+                                length, expected_sha256, capture_live, speed_khz, quirk)
 
 
 @mcp.tool()
