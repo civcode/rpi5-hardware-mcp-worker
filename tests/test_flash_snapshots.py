@@ -50,6 +50,34 @@ class SnapshotTests(unittest.TestCase):
         with patch("flash_snapshots.subprocess.run", side_effect=fake_run):
             return self.store.capture(["openocd", "-f", "target/stm32f1x.cfg"], self.work, "test")
 
+    def test_fingerprint_ignores_configuration_outside_application(self):
+        before = self.capture(self.first)["snapshot_id"]
+        after = self.capture(bytes(self.second))["snapshot_id"]
+        left = self.store.fingerprint(before)
+        right = self.store.fingerprint(after, expected_sha256=left["sha256"])
+        self.assertTrue(right["matches_expected"], right)
+        self.assertEqual(left["length"], 78 * 1024)
+        self.assertNotEqual(left["snapshot_sha256"], right["snapshot_sha256"])
+        config = self.store.fingerprint(after, 0x08013800, 1024)
+        self.assertTrue(config["includes_protected_region"])
+
+    def test_fingerprint_capacity_integrity_and_exact_range(self):
+        snap = self.capture(self.first[:65536], kib=64)["snapshot_id"]
+        result = self.store.fingerprint(snap)
+        self.assertEqual(result["length"], 65536)
+        self.assertEqual(result["sha256"], hashlib.sha256(self.first[:65536]).hexdigest())
+        for start, length in ((0x0800ffff, 2), (0x07ffffff, 1),
+                              (0x08000000, -1), (True, 1)):
+            with self.assertRaises(SnapshotError):
+                self.store.fingerprint(snap, start, length)
+        with self.assertRaises(SnapshotError):
+            self.store.fingerprint(snap, expected_sha256="not-a-hash")
+        piece = self.store.fingerprint(snap, 0x08000003, 7)
+        self.assertEqual(piece["sha256"], hashlib.sha256(self.first[3:10]).hexdigest())
+        Path(self.store.info(snap)["path"]).write_bytes(b"corrupt")
+        with self.assertRaises(SnapshotError):
+            self.store.fingerprint(snap)
+
     def test_capture_persists_sha_and_resumes(self):
         result = self.capture(self.first)
         self.assertTrue(result["ok"])
