@@ -95,7 +95,12 @@ The Raspberry Pi 5 is named `edge`; use its LAN/mDNS hostname `edge.local`, or i
 | `fault_snapshot` | **Halts MCU** and reads fault status; CPU-register values are not yet reliably returned by the current tool (see verified findings below). No reset/program |
 | `start_gdb_server` | Start one persistent OpenOCD process for remote GDB on `:3333` |
 | `gdb_server_status` | Report server state, PID and recent OpenOCD logs |
-| `gdb_command` | Persistent GDB console/MI command transport; no token required |
+| `gdb_command` | Persistent GDB console/MI; optional session_id guard; no silent reattach after loss |
+| `gdb_session_start` / `gdb_session_stop` | Explicit local GDB attach/disconnect; OpenOCD managed separately |
+| `gdb_session_status` | Host-only session identity, GDB/OpenOCD PIDs, loss diagnostics and last observed state |
+| `target_execution_status` | Cached observation by default; optionally query OpenOCD targets through existing GDB |
+| `target_reset` | Explicit reset run/halt with confirm=RESET; report acceptance separately from observed state |
+| `firmware_fingerprint` | Hash exact application flash range from saved snapshot or explicitly requested live capture |
 | `stop_gdb_server` | Stop persistent OpenOCD process |
 | `begin_firmware_upload` | Create host-only bounded chunked upload; original byte count and SHA-256 required |\n| `upload_firmware_chunk` | Transfer 1–8192 original bytes as Base64 at an exact byte offset; identical retry safe |\n| `finalize_firmware_upload` / `abort_firmware_upload` | Validate complete HEX and stage an artifact, or abort partial upload; no target access |\n| `flash_preflight` | Rehash staged artifact and check protected flash/config boundary plus probe ownership; host-only, capacity probe deferred |\n| `stage_hex` | Stage an Intel HEX image sent as base64; checks checksums, address range and SHA-256; **does not flash** |
 | `staged_hex_info` | Rehash a staged HEX and return its generated OpenOCD path; **does not access the target** |
@@ -118,16 +123,64 @@ The optional `quirk=true` parameter requests OpenOCD CMSIS-DAP single-packet com
 
 ### MCP GDB command transport
 
-The `gdb_command(command, timeout_seconds=30)` tool forwards GDB
-console commands or native MI commands (prefixed with `-`) through a persistent
-`gdb-multiarch` session on the Pi. Start OpenOCD using `start_gdb_server` first.
-Use an empty command to poll pending MI output; `stop_gdb_server` ends the session.
+OpenOCD and the Pi-local GDB client are separate processes. Start OpenOCD with
+`start_gdb_server`, then call `gdb_session_start` to attach (may halt the MCU).
+For compatibility, the first nonempty `gdb_command` can still attach lazily in
+a newly started server epoch. **After timeout, unexpected exit, disconnect or
+explicit stop, commands fail closed until explicit `gdb_session_start`.**
+Commands are never automatically replayed.
 
-No token or command allowlist is required. Commands can affect the Pi and
-MCU, including writing memory or programming flash. The MCP HTTP endpoint
-is plaintext and should remain reachable only from the protected development
-network. Avoid exposing port 8766 to untrusted clients.
-On a command timeout the client session is closed and the target state is unknown.
+- Record `session_id`, `gdb_pid` and `openocd_pid`. Pass `session_id` with
+  subsequent commands to reject stale requests, including across worker
+  restarts. Explicit reattach returns a new identity and `session_recreated: true`.
+- `gdb_session_status` and `gdb_server_status` report health without attaching
+  or sending protocol commands. `last_gdb_pid`, `gdb_exit_code` and
+  `session_loss_reason` are best-effort diagnostics.
+- CLI/native MI commands run on the Pi. An empty command polls pending MI output
+  without initiating a session. Raw commands remain unrestricted.
+- `gdb_session_stop` terminates local GDB only. `stop_gdb_server` stops both.
+  Neither explicitly requests halt/resume/reset; OpenOCD disconnect handling
+  can nevertheless affect execution. Do not use a concurrent external GDB client.
+- `target_execution_status()` is a cached observation, not a live guarantee.
+  Async MI records are tracked between commands. `target_state_source="gdb_mi"`
+  reflects GDB's view and is not marked hardware-verified. Arbitrary commands
+  invalidate prior state observations. `target_execution_status(refresh=true)`
+  uses best-effort `monitor targets` on an existing session without intentional
+  halt/resume. Only an unambiguous OpenOCD state is marked verified, at the
+  reported Unix observation timestamp. GDB may reject monitor commands while
+  running; unavailable observations remain unknown rather than forcing a halt.
+- `target_reset(mode="run", confirm="RESET", session_id=...)` (or mode halt)
+  requires an active session. It reports `reset_command_accepted` and
+  `requested_state_observed` separately; ok=true requires both. Reset may
+  have happened even if verification failed: do not retry blindly. Check UART
+  independently. No firmware programming is requested.
+
+The plaintext MCP endpoint and unrestricted GDB command language are intended
+only for the trusted development LAN.
+
+### Firmware identity before symbolizing RAM
+
+Use `firmware_fingerprint(snapshot_id="...")` on an integrity-checked saved
+snapshot (host-only), or explicitly request `firmware_fingerprint(capture_live=true)`
+when OpenOCD does not own the probe. Live capture uses the existing full-flash
+snapshot: temporary halt, explicit resume, factory capacity validation and
+persistent snapshot. It refuses while the managed GDB server owns the probe,
+and never programs or resets flash. Do not capture a board that must stay halted.
+
+Default fingerprint range: 0x08000000 through (exclusive) the lower of actual
+flash limit and 0x08013800 (existing configuration protection boundary).
+Set start_address and positive length for an exact custom range. Optional
+expected_sha256 returns matches_expected. Compare the same raw bytes over the
+same range from reference/candidate images, including agreed gap padding,
+**not the hash of an ELF or HEX file itself**. A match identifies only that
+interval and does not establish the runtime RAM layout.
+
+For H0016-style investigations, stop GDB/OpenOCD deliberately, capture a
+fingerprint, check the resume result and UART, compare with candidate/reference
+raw application bytes, and choose the matching ELF on Oberon. Then start
+OpenOCD and attach one GDB client. Record session ID for MCP debugging.
+Reset only when authorized; use UART independently to verify execution and
+symbolize RAM only using the matching ELF.
 
 ## USB-UART and AT commands
 
