@@ -229,6 +229,82 @@ class WorkerTests(unittest.TestCase):
             inspect_intel_hex(good_hex().replace(b":00000001FF\n", b""))
         self.assertEqual(failure.exception.code, "HEX_MISSING_EOF")
 
+    def test_new_status_tools_do_not_attach(self):
+        with patch.object(self.worker._gdb_client, "_start") as start:
+            self.assertTrue(self.worker.gdb_session_status()["ok"])
+            self.assertTrue(self.worker.target_execution_status()["ok"])
+            self.assertFalse(self.worker.target_execution_status(refresh=True)["ok"])
+            self.assertFalse(self.worker.gdb_session_start()["ok"])
+            self.assertFalse(self.worker.target_reset("run", "RESET")["ok"])
+            start.assert_not_called()
+
+    def test_reset_requires_confirmation_and_reports_observation(self):
+        metadata = {"openocd_running": True, "session_state": "active",
+                    "session_lost": False, "target_state": "unknown",
+                    "target_state_verified": False}
+        with patch.object(self.worker, "_gdb_metadata", return_value=metadata), \
+                patch.object(self.worker._gdb_client, "command") as command:
+            self.assertFalse(self.worker.target_reset("run", "")["ok"])
+            command.assert_not_called()
+            command.return_value = {"ok": True, "result_class": "done"}
+            result = self.worker.target_reset("run", "RESET")
+            self.assertTrue(result["reset_command_accepted"])
+            self.assertFalse(result["requested_state_observed"])
+            self.assertFalse(result["ok"])
+            command.assert_called_once_with("monitor reset run", 3333, 30, "", require_existing=True)
+
+    def test_reset_success_requires_matching_probe_and_session(self):
+        before = {"openocd_running": True, "session_state": "active",
+                  "session_lost": False, "target_state": "unknown",
+                  "target_state_verified": False}
+        after = {**before, "target_state": "running", "target_state_verified": True}
+        with patch.object(self.worker, "_gdb_metadata", side_effect=[before, after]), \
+                patch.object(self.worker._gdb_client, "command", return_value={
+                    "ok": True, "result_class": "done", "state_probe": {"ok": True}}):
+            result = self.worker.target_reset("run", "RESET", "expected")
+            self.assertTrue(result["reset_command_accepted"], result)
+            self.assertTrue(result["requested_state_observed"], result)
+            self.assertTrue(result["ok"], result)
+        with patch.object(self.worker, "_gdb_metadata", return_value=after), \
+                patch.object(self.worker._gdb_client, "command", return_value={
+                    "ok": False, "error": "GDB session_id mismatch"}):
+            result = self.worker.target_reset("run", "RESET", "stale")
+            self.assertFalse(result["reset_command_accepted"])
+            self.assertFalse(result["requested_state_observed"])
+
+    def test_fingerprint_live_capture_preserves_resume_metadata(self):
+        from flash_snapshots import SnapshotError
+        with patch.object(self.worker, "flash_snapshot", return_value={
+                "ok": True, "snapshot_id": "a" * 32, "resumed": True, "flash_kib": 64}) as capture, \
+                patch.object(self.worker.flash_snapshots, "fingerprint") as fingerprint:
+            fingerprint.return_value = {"ok": True, "length": 65536}
+            result = self.worker.firmware_fingerprint(capture_live=True)
+            self.assertTrue(result["resumed"])
+            self.assertEqual(result["source"], "live_snapshot")
+            capture.assert_called_once_with(1000, "firmware-fingerprint", False)
+            fingerprint.side_effect = SnapshotError("capacity exceeded")
+            result = self.worker.firmware_fingerprint(capture_live=True, length=100000)
+            self.assertFalse(result["ok"])
+            self.assertTrue(result["resumed"])
+            self.assertEqual(result["snapshot_id"], "a" * 32)
+
+    def test_fingerprint_preserves_probe_exclusivity_and_offline_path(self):
+        fake_proc = type("FakeProc", (), {"poll": lambda self: None, "pid": 1337})()
+        self.worker._process = fake_proc
+        try:
+            with patch.object(self.worker.flash_snapshots, "capture") as capture, \
+                    patch.object(self.worker.flash_snapshots, "fingerprint",
+                                 return_value={"ok": True, "sha256": "test"}) as fingerprint:
+                blocked = self.worker.firmware_fingerprint(capture_live=True)
+                self.assertFalse(blocked["ok"])
+                capture.assert_not_called()
+                saved = self.worker.firmware_fingerprint(snapshot_id="a" * 32)
+                self.assertTrue(saved["ok"])
+                self.assertEqual(saved["source"], "saved_snapshot")
+                fingerprint.assert_called_once_with("a" * 32, FLASH_START, 0, "")
+        finally:
+            self.worker._process = None
+
     def test_wrong_host_gdb_path_rejected_before_sending(self):
         from worker_core import pi_gdb_file_error
         result = pi_gdb_file_error("file /tmp/oberon-only-project.elf")
