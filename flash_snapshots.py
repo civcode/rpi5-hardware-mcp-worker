@@ -159,6 +159,39 @@ class FlashSnapshotStore:
             raise SnapshotError(f"Snapshot failed integrity verification: {snapshot_id}")
         return data, info
 
+    @staticmethod
+    def validate_fingerprint_range(start_address: int, length: int,
+                                   expected_sha256: str = "") -> None:
+        limit = FLASH_START + max(ALLOWED_FLASH_KIB) * 1024
+        if (type(start_address) is not int or type(length) is not int or
+                not FLASH_START <= start_address < limit or
+                length < 0 or start_address + length > limit or
+                (length == 0 and start_address >= 0x08013800)):
+            raise SnapshotError("Fingerprint range must fit main flash; length=0 selects application end")
+        if not isinstance(expected_sha256, str) or (expected_sha256 and
+                not re.fullmatch(r"[0-9a-fA-F]{64}", expected_sha256)):
+            raise SnapshotError("expected_sha256 must be empty or 64 hexadecimal characters")
+
+    def fingerprint(self, snapshot_id: str, start_address: int = FLASH_START,
+                    length: int = 0, expected_sha256: str = "") -> dict:
+        """Hash raw captured flash bytes, not an ELF or a sparse HEX file."""
+        self.validate_fingerprint_range(start_address, length, expected_sha256)
+        data, info = self._read(snapshot_id)
+        offset = start_address - FLASH_START
+        if length == 0:
+            length = min(len(data), 0x08013800 - FLASH_START) - offset
+        if length <= 0 or offset + length > len(data):
+            raise SnapshotError("Fingerprint range exceeds captured factory flash capacity")
+        digest = _sha(data[offset:offset + length])
+        return {"ok": True, "snapshot_id": snapshot_id,
+                "captured_utc": info.get("captured_utc"), "flash_kib": info["flash_kib"],
+                "start_address": f"0x{start_address:08X}",
+                "end_exclusive": f"0x{start_address + length:08X}", "length": length,
+                "sha256": digest, "snapshot_sha256": info["sha256"],
+                "matches_expected": digest == expected_sha256.lower() if expected_sha256 else None,
+                "includes_protected_region": start_address + length > 0x08013800,
+                "note": "Compare binary bytes over exactly this address interval, not ELF/HEX file hashes."}
+
     def info(self, snapshot_id: str) -> dict:
         _, info = self._read(snapshot_id)
         return {"ok": True, **info, "path": str(self._paths(snapshot_id)[0])}
