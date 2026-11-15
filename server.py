@@ -73,8 +73,12 @@ mcp = MCPServer(
 
 @mcp.tool()
 def diagnose_host() -> dict:
-    """Report Pi 5 Linux/USB/OpenOCD status; no target access or flash operations."""
-    return worker.diagnose_host()
+    """Host-only Linux/USB/OpenOCD diagnostics, Git revision/branch/dirty state and capabilities.
+    Git metadata and file hashes reflect disk at query time, not proof of a restarted process."""
+    return {**worker.diagnose_host(), "capabilities": {
+        "gdb_cli": True, "gdb_mi": True, "serial_capture": True,
+        "serial_modem_control": True, "raw_serial": True, "artifacts": True,
+        "flash_snapshots": True, "flash_region_digests": True}}
 
 
 @mcp.tool()
@@ -178,9 +182,10 @@ def target_execution_status(refresh: bool = False) -> dict:
 
 
 @mcp.tool()
-def target_reset(mode: str, confirm: str, session_id: str = "") -> dict:
-    """Explicit runtime reset: mode run/halt, confirm RESET. Requires existing session.
-    Returns command acceptance separately from observed requested state. Never programs flash."""
+def target_reset(mode: str, confirm: str = "", session_id: str = "") -> dict:
+    """Convenience reset run/halt in an existing GDB session. Legacy confirm ignored.
+    Returns acceptance separately from observed state. Reset may occur even if verification fails.
+    Native monitor reset is an alternative. Never requests programming."""
     return worker.target_reset(mode, confirm, session_id)
 
 
@@ -192,7 +197,9 @@ def firmware_fingerprint(snapshot_id: str = "", start_address: int = 0x08000000,
     """SHA-256 over exact raw flash bytes; default application range ends at 0x08013800
     or factory capacity, whichever is lower. Use a saved snapshot OR capture_live=true.
     Live capture temporarily HALTS then RESUMES, and refuses if OpenOCD owns probe.
-    Never programs/resets flash. Optional expected hash compares the same address interval."""
+    Never programs/resets flash. Optional expected hash compares the same address interval.
+    Returns exact range plus named raw full/application/config/protected digests from one snapshot;
+    absent regions are null (e.g. config on 64 KiB). Not the HEX or ELF file hash."""
     return snapshot_tool_result(worker.firmware_fingerprint, snapshot_id, start_address,
                                 length, expected_sha256, capture_live, speed_khz, quirk)
 
@@ -247,29 +254,28 @@ def abort_firmware_upload(upload_id: str) -> dict:
 
 
 @mcp.tool()
-def flash_preflight(artifact_id: str) -> dict:
-    """SAFE, HOST-ONLY: rehash staged HEX, check protected config boundary,
-    and report OpenOCD GDB probe ownership WITHOUT halting/resetting the MCU.
-    Actual target flash capacity is NOT read here (reported NOT_PROBED);
-    flash_hex probes factory capacity before programming. Never flash during preflight."""
-    return _firmware_tool_result(worker.flash_preflight, artifact_id)
+def flash_preflight(artifact_id: str, allow_protected: bool = False) -> dict:
+    """Host-only plan: verify staged HEX hash, report historical BU04 config overlap and probe ownership.
+    allow_protected=true permits intentional config-region programming in the plan; pass the same
+    option to flash_hex. Cached capacity is not a fresh probe. No target access or programming."""
+    return _firmware_tool_result(worker.flash_preflight, artifact_id, allow_protected)
 
 
 @mcp.tool()
 def staged_hex_info(artifact_id: str) -> dict:
     """Rehash a staged HEX on the PI filesystem; the returned path is on the Pi,
-    NOT Oberon. Never accesses target and is not flash authorization."""
+    NOT Oberon. No target access; native GDB/OpenOCD may use the returned path."""
     return worker.staged_hex_info(artifact_id)
 
 
 @mcp.tool()
 def flash_hex(artifact_id: str, confirm_sha256: str, confirm: str = "", speed_khz: int = 100,
-              quirk: bool = False) -> dict:
-    """DESTRUCTIVE Board flash: require confirm='FLASH', staged SHA-256,
-    config-boundary preflight, actual target factory capacity, and reset halt.
-    Programs/verifies/resets the MCU. No arbitrary local/Oberon file paths accepted.
-    Do not run while GDB server owns probe. Never run without explicit authorization."""
-    return worker.flash_hex(artifact_id, confirm_sha256, confirm, speed_khz, quirk)
+              quirk: bool = False, allow_protected: bool = False) -> dict:
+    """Program staged Intel HEX: verifies expected file SHA-256, detects physical flash capacity,
+    resets/halt, programs/verifies/resets MCU. Legacy confirm ignored. Historical BU04 config
+    overlap blocked by default; allow_protected=true permits intentional overlap. Reports warning.
+    Use native GDB/OpenOCD for other programming methods. Standalone probe requires sole ownership."""
+    return worker.flash_hex(artifact_id, confirm_sha256, confirm, speed_khz, quirk, allow_protected)
 
 
 @mcp.tool()

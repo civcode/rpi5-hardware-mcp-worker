@@ -121,12 +121,14 @@ class WorkerTests(unittest.TestCase):
             self.assertFalse(worker.staged_hex_info(item['artifact_id'])['ok'])
             worker.close()
 
-    def test_stage_flash_requires_double_confirmation(self):
+    def test_stage_flash_requires_matching_digest(self):
         data = good_hex()
         sha = hashlib.sha256(data).hexdigest()
         item = self.worker.stage_hex(base64.b64encode(data).decode(), sha)
         self.assertEqual(item['sha256'], sha)
-        self.assertFalse(self.worker.flash_hex(item['artifact_id'], sha)['ok'])
+        with patch.object(self.worker, 'probe_target', return_value={'ok': True, 'flash_kib': 128}), \
+                patch.object(self.worker, '_one_shot', return_value={'ok': True}):
+            self.assertTrue(self.worker.flash_hex(item['artifact_id'], sha)['ok'])
         self.assertFalse(self.worker.flash_hex(item['artifact_id'], '0'*64, confirm='FLASH')['ok'])
 
     def test_reject_flash_larger_than_physical_capacity(self):
@@ -213,6 +215,7 @@ class WorkerTests(unittest.TestCase):
             result = self.worker.flash_hex(stage["artifact_id"], stage["sha256"], confirm="FLASH")
             self.assertFalse(result["ok"])
             openocd.assert_not_called()
+            self.assertTrue(self.worker.flash_preflight(stage["artifact_id"], allow_protected=True)["ready_for_flash_request"])
 
     def test_flash_preparation_explicit_reset_halt(self):
         stage = self.worker.stage_hex(base64.b64encode(good_hex()).decode())
@@ -238,16 +241,14 @@ class WorkerTests(unittest.TestCase):
             self.assertFalse(self.worker.target_reset("run", "RESET")["ok"])
             start.assert_not_called()
 
-    def test_reset_requires_confirmation_and_reports_observation(self):
+    def test_reset_needs_no_confirmation_and_reports_observation(self):
         metadata = {"openocd_running": True, "session_state": "active",
                     "session_lost": False, "target_state": "unknown",
                     "target_state_verified": False}
         with patch.object(self.worker, "_gdb_metadata", return_value=metadata), \
                 patch.object(self.worker._gdb_client, "command") as command:
-            self.assertFalse(self.worker.target_reset("run", "")["ok"])
-            command.assert_not_called()
             command.return_value = {"ok": True, "result_class": "done"}
-            result = self.worker.target_reset("run", "RESET")
+            result = self.worker.target_reset("run")
             self.assertTrue(result["reset_command_accepted"])
             self.assertFalse(result["requested_state_observed"])
             self.assertFalse(result["ok"])
