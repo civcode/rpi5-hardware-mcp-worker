@@ -4,6 +4,8 @@ This worker provides **read-only main-flash snapshots** and **host-only diffs** 
 a separate STM32F103 running stock `BU03_BU04_AT_V1.0.1_T2026-09-02.hex` can
 be investigated without changing the working ATfE target.
 
+This guide describes a controlled stock-configuration mapping experiment, not project-wide restrictions. Other experiments may intentionally use raw UART, GDB or OpenOCD differently. See [AGENTS.md](AGENTS.md).
+
 The experiment separates three actions:
 
 1. **Snapshot**: OpenOCD reads main flash over SWD; no erase, programming,
@@ -11,8 +13,8 @@ The experiment separates three actions:
    The CPU is halted briefly and **explicitly resumed**. The target may
    experience a timing interruption. If the tool returns `resumed: false`,
    stop and inspect the target state before continuing.
-2. **Change/save**: Only the operator, after separate authorization, sends
-   documented stock AT configuration setters and `AT+SAVE`. `AT+SAVE`
+2. **Change/save**: A deliberate experiment step sends documented stock AT
+   configuration setters and `AT+SAVE`. `AT+SAVE`
    **writes main flash and resets the STM32**; the snapshot tool does not.
 3. **Diff**: Compares immutable snapshot binary files on `edge`, without
    touching the target. Produces per-page counts, contiguous runs, a
@@ -92,16 +94,12 @@ not a measured minimum of the 2026 stock firmware.
 
 For this configuration mapping experiment:
 
-- Use only these guarded AT tools for transmitted AT commands.
-- Do **not** use `serial_exchange` for AT commands: it is a general raw
-  transmit endpoint and bypasses the AT-specific frame-length/pacing guards.
-- Never split an AT command across several UART tool calls to bypass length
-  checks.
+- Prefer the AT convenience tools for stock configuration mapping to keep framing and pacing consistent across trials.
+- Raw `serial_exchange` does not apply those checks; use it when intentionally investigating UART framing, pacing or buffer limits.
+- Splitting a command across calls can change its timing and framing; account for this when interpreting results.
 - Do not send a second command until the first response has ended or timed
-  out; ensure the module has booted after any approved `AT+SAVE` reset.
-- If a desired setter exceeds 61 command bytes, **do not send it**.
-  Report its full length and propose a shorter documented numeric
-  representation while retaining the same numerical values.
+  out; ensure the module has booted after an `AT+SAVE` reset.
+- If a desired setter exceeds 61 command bytes, the convenience endpoints reject it. For this mapping procedure a shorter documented equivalent is preferable; raw transmission is a separate experimental choice with possible buffer wrap or malformed commands.
 - A command length that is safe under the 2024 source is not proof of an
   identical RX limit in the 2026 binary; keep pacing and monitor responses.
 
@@ -121,7 +119,7 @@ receiver, so their payload sizes are unrelated to the 64-byte AT buffer.
    sending any AT write/save**, and diff the two IDs. Ideally no main-flash
    changes. If bytes change, investigate background persistence first.
 
-**Only with explicit authorization for flash-changing AT operations**
+**Flash-changing steps, when selected for this experiment**
 
 4. Issue `AT+SAVE` **without changing a setting**, wait for reboot/AT,
    snapshot `stock-no-change-save`, diff with control. This reveals
@@ -152,7 +150,7 @@ flash_snapshot_diff(before_id=A.snapshot_id,
                     after_id=B.snapshot_id, label="no-write control")
 ```
 
-After an authorized `AT+SAVE`, call `flash_snapshot` again and compare.
+After the selected `AT+SAVE` step, call `flash_snapshot` again and compare.
 `flash_snapshot_diff` must never issue AT commands or OpenOCD commands.
 
 ## Offline comparison of existing backups
@@ -184,7 +182,7 @@ same firmware image; diff the snapshots **within the stock-firmware
 sequence**, not across different firmware builds. Main-flash code bytes
 would otherwise overwhelm the config differences.
 
-## Safety and current verification status
+## Operation effects and historical verification status
 
 - No flasher, debugger server, serial setter, or reset call is invoked by
   the snapshot/diff tool. Snapshot uses OpenOCD `init; halt; read_memory;

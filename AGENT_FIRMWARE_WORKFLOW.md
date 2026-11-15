@@ -5,10 +5,12 @@ owns Git worktrees and built `Project.elf` / `Project.hex`. The *Raspberry Pi*
 runs this MCP server, OpenOCD, the worker-managed GDB client, and the SWD probe.
 An absolute path on Oberon is **not** a path on the Pi.
 
-## Preferred automated staging (no hardware access)
+This is a suggested workflow for staged HEX artifacts, not a mandatory route for native debugging. See [AGENTS.md](AGENTS.md).
+
+## Suggested automated staging (no hardware access)
 
 Use the MCP **tool calls**, not a giant Base64 string pasted into a chat.
-No shell access to the Pi is required. Never call `flash_hex` during staging.
+No shell access to the Pi is required. Staging and programming are independent steps; `flash_hex` changes target flash.
 
 1. On Oberon, read the original HEX file as **bytes**. Calculate
    `total_bytes = len(data)` and `expected_sha256 = sha256(data).hexdigest()`.
@@ -34,11 +36,11 @@ No shell access to the Pi is required. Never call `flash_hex` during staging.
    contact or halt Board A. `target_flash_kib` is therefore `null` with
    `capacity_status=NOT_PROBED_HOST_ONLY`. **`flash_hex` performs a fresh
    factory-capacity probe before programming.**
-6. Only with explicit authorization and a verified recovery image, invoke
-   `flash_hex(artifact_id, confirm_sha256, confirm="FLASH")`. It checks
+6. When the experiment calls for programming, the current convenience endpoint is
+   `flash_hex(artifact_id, confirm_sha256, confirm="FLASH")`. A verified recovery image is recommended. It checks
    the preflight, probe ownership, SHA-256, capacity, then performs
    `reset halt` before programming and requests verify/reset.
-   A successful staging or preflight result **does not authorize flashing**.
+   A successful staging or preflight result does not demonstrate that programming has occurred or will succeed.
 7. Verify the complete programming output, protected configuration/flash
    recovery expectations, Board A startup and actual application behavior.
    Never infer a hardware PASS from a successful compile or ELF link alone.
@@ -48,7 +50,7 @@ The app/config boundary for this project's Board A build is
 that extend into `[0x08013800, 0x08020000)`. The protected-range check
 examines the image's highest addressed data byte. This is a **data-range
 check**, not proof that the MCU's physical erase granularity leaves saved
-configuration intact. Always preserve and check recovery/config backups.
+configuration intact. Recovery/config backups are useful when the experiment requires preservation or rollback. These checks apply to the convenience endpoints, not native GDB/OpenOCD.
 
 Upload sessions are transient to one MCP worker instance; restarting the
 worker invalidates partial uploads and staged artifact IDs. At most four
@@ -63,7 +65,7 @@ port 3333. To load an ELF that resides on Oberon, run GDB **on Oberon**:
 gdb-multiarch /absolute/path/to/build/Project.elf
 ```
 
-Then, *after an explicit authorized flashing decision*:
+Example when the experiment calls for programming:
 
 ```gdb
 target extended-remote edge.local:3333
@@ -79,20 +81,20 @@ Use the actual OpenOCD host/port returned by the MCP deployment. The
 `file`, `symbol-file`, and `load <path>` paths must exist on the Pi.
 A tool error `GDB_FILE_NOT_ON_PI` means that condition was not met.
 Similarly, a `monitor flash write_image` file path is resolved by OpenOCD
-**on the Pi**, not on Oberon. Do not mix these two workflows.
+**on the Pi**, not on Oberon. Choose each path according to the host executing the command.
 
 **Only one OpenOCD process should own the probe.** Stop the managed GDB server
 before using standalone MCP `flash_hex`; don't run both at once.
 
-## Agent diagnostic rules
+## Diagnostic interpretation and recovery options
 
 - `UPLOAD_INCOMPLETE`: read `next_offset`; send the remaining bytes.
 - `CHUNK_OUT_OF_ORDER`: use the worker's expected `next_offset` in bytes.
 - `CHUNK_CONFLICT`: a retransmission changed; re-check source file.
-- `UPLOAD_SHA256_MISMATCH`: do not flash; regenerate and inspect transport.
+- `UPLOAD_SHA256_MISMATCH`: the staged bytes do not match the intended digest; regenerate or inspect the transport.
 - `HEX_MISSING_EOF` / `HEX_NO_DATA`: inspect the **decoded** payload and
   confirm the input was original HEX bytes, not a path or other content.
-- `IMAGE_OVERLAPS_PROTECTED_FLASH`: refuse flash; correct the linker/image.
+- `IMAGE_OVERLAPS_PROTECTED_FLASH`: the current staged-image endpoint rejects this range. Check the linker/image for an app-only operation; native GDB/OpenOCD is a separate interface when a different range is intentional.
 - `GDB_SERVER_OWNS_PROBE`: stop GDB server or use the intentionally selected
   GDB workflow. Never launch a competing OpenOCD session.
 - `probe_target`, `fault_snapshot`, and GDB halt commands can **halt the MCU**
@@ -100,5 +102,5 @@ before using standalone MCP `flash_hex`; don't run both at once.
   resume when appropriate. A read-only flash preflight does **not** halt.
 - If programming fails, capture OpenOCD logs and fault registers **before**
   clearing target state; don't blindly retry or automatically restore TWR.
-- Do not modify other boards or run GitHub Actions. Use local tests
+- Identify the board selected for the experiment. Do not run GitHub Actions unless explicitly requested. Use local tests
   (`python3 -m pytest -q`), and do not create automatic Actions triggers.
