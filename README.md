@@ -2,7 +2,20 @@
 
 A minimal **plain-LAN-HTTP** Model Context Protocol worker for the **Raspberry Pi Debug Probe / Pico with debugprobe firmware** attached over USB to a Raspberry Pi 5, debugging an STM32F103 BU03/BU04 over SWD.
 
-This is **not** a replacement for GDB or OpenOCD. The worker runs OpenOCD **on the Pi**, offers a few Pi coding agent tools, and starts/stops an OpenOCD **GDB TCP server on port 3333**. GDB on the Oberon workstation can connect directly to `edge.local:3333` and use the **local ATfE ELF with symbols**. It does not require SSH, TLS, a service manager, or a checkout of the SDK on the Pi.
+This is **not** a replacement for GDB or OpenOCD. The worker runs OpenOCD **on the Pi**, exposes native debugging capabilities and supporting MCP tools, and starts/stops an OpenOCD **GDB TCP server on port 3333**. GDB on the Oberon workstation can connect directly to `edge.local:3333` and use the **local ATfE ELF with symbols**. It does not require SSH, TLS, a service manager, or a checkout of the SDK on the Pi.
+
+## Architecture and Design Philosophy
+
+This is an **agent-oriented rapid-prototyping and hardware experimentation tool**. Its purpose is to maximize the agent's action space through broad, reliable native GDB/OpenOCD access and, where implemented, raw UART access. The worker provides capabilities and information; the agent chooses experiments, commands and recovery strategies.
+
+- Prefer native, general-purpose interfaces over narrow operation-specific wrappers.
+- Treat MCP tool descriptions as an operating manual: explain parameters, defaults, examples, side effects, hardware quirks, observations and recovery options.
+- Prefer informative warnings and configurable defaults to unnecessary restrictions or mandatory experimental workflows.
+- Manage technical constraints such as exclusive probe ownership, transport, session lifecycle and data integrity; do not impose the experiment's methodology.
+- Preserve raw results and metadata, distinguish observations from assumptions, and avoid silent state changes or command replay.
+- Keep abstractions minimal. Convenience tools complement, not replace, native access.
+
+Plain LAN HTTP is intentional. Connection security, authentication and TLS are outside scope. See [AGENTS.md](AGENTS.md) for the full design principles and development guidance. Current tool-specific checks described below are implementation behavior, not a project-wide policy; board-specific examples are recommendations for those experiments.
 
 ## Architecture
 
@@ -140,7 +153,7 @@ bt
 monitor reset halt
 thbreak main
 continue
-# Explicitly destructive, only when approved and backup/capacity verified:
+# Programs flash; use when the experiment calls for programming:
 # monitor reset halt
 # load
 # compare-sections
@@ -148,13 +161,13 @@ continue
 
 OpenOCD supports `monitor` commands over the existing GDB connection. Do **not** run standalone `probe_target` while GDB already owns the probe. If GDB TCP port is not reachable, check the host/IP and Pi firewall/network; the worker passes `bindto 0.0.0.0` to the OpenOCD server, with Tcl and telnet ports disabled.
 
-## Firmware validation order
+## Historical firmware validation sequence
 
 1. **Completed:** USB CMSIS-DAP/SWD target detection; record 128 KiB flash size and device ID.
 2. **Completed:** direct OpenOCD programming/verification of the original 2026 HEX and AT UART baseline.
 3. **Completed:** MCP diagnostics/target probe/GDB server; Oberon remote GDB register, memory, disassembly and detach checks.
 4. **Outstanding:** fix numeric CPU-register capture in `fault_snapshot` and verify it on the live device.
-5. **Next:** debug minimal `firmware_core.elf` and full ATfE `Project.elf` only after explicitly authorized programming and with a matching symbol file; investigate startup/stack/clock/interrupts/ABI.
+5. **Next:** debug minimal `firmware_core.elf` and full ATfE `Project.elf` after intentional programming when needed, with a matching symbol file; investigate startup/stack/clock/interrupts/ABI.
 
 ## Tests and scope
 
@@ -163,10 +176,10 @@ python3 -m unittest discover -s tests -v
 python3 -m py_compile server.py worker_core.py
 ```
 
-Unit tests mock OpenOCD. **Live Pi 5 USB/SWD access, MCP diagnostics/probe/GDB-server control, remote GDB, and direct OpenOCD programming plus verification of the reference HEX are now verified on hardware (2026-11-03).** The MCP flash endpoints and ATfE firmware runtime remain unverified. The service is intentionally unauthenticated and unencrypted for the trusted local LAN, as requested. It can halt the target and optionally write flash; keep port 8766 on that LAN. There are **no GitHub Actions workflows** and nothing starts automatically after reboot.
+Unit tests mock OpenOCD. **Live Pi 5 USB/SWD access, MCP diagnostics/probe/GDB-server control, remote GDB, and direct OpenOCD programming plus verification of the reference HEX are now verified on hardware (2026-11-03).** The MCP flash endpoints and ATfE firmware runtime remain unverified. Plain HTTP on the trusted development LAN is intentional; connection security is outside project scope. Native debugging can halt, reset or program the target. There are **no GitHub Actions workflows** and nothing starts automatically after reboot.
 
 ## Repository role
 
-Suggested canonical GitHub repository: `civcode/rpi5-openocd-mcp-worker` (separate from `civcode/STM32F103-BU0x_SDK`). The STM32 `ATfE-port` project already contains the basic `tools/rpi5-debug` shell scripts and `docs/RPI5_OPENOCD_DEBUG.md`; the dedicated MCP worker adds remote orchestration and should link to those instructions rather than duplicating their logic in the firmware repository.
+Canonical GitHub repository: `civcode/rpi5-hardware-mcp-worker` (separate from `civcode/STM32F103-BU0x_SDK`). The STM32 `ATfE-port` project already contains the basic `tools/rpi5-debug` shell scripts and `docs/RPI5_OPENOCD_DEBUG.md`; the dedicated MCP worker adds remote orchestration and should link to those instructions rather than duplicating their logic in the firmware repository.
 
 Reference documentation: https://openocd.org/doc/html/Server-Configuration.html , https://openocd.org/doc/html/Debug-Adapter-Configuration.html , https://github.com/raspberrypi/debugprobe/releases , https://py.sdk.modelcontextprotocol.io/run/ .
