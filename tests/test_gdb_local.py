@@ -46,6 +46,8 @@ class TestLocalGDB(unittest.TestCase):
         self.executable.write_text(STUB.format(python=os.sys.executable))
         self.executable.chmod(0o755)
         self.gdb = LocalGDB(executable=str(self.executable))
+        from artifacts import ArtifactStore
+        self.gdb.artifacts = ArtifactStore(self.tmp.name)
 
     def tearDown(self):
         self.gdb.close()

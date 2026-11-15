@@ -59,6 +59,8 @@ class ManagedSessionTests(unittest.TestCase):
         executable.write_text(STUB.format(python=os.sys.executable))
         executable.chmod(0o755)
         self.gdb = ManagedGDB(str(executable))
+        from artifacts import ArtifactStore
+        self.gdb.artifacts = ArtifactStore(self.tmp.name)
         self.addCleanup(self.gdb.close)
 
     def test_lazy_first_attach_then_stable_session_and_pid(self):
@@ -139,6 +141,25 @@ class ManagedSessionTests(unittest.TestCase):
         self.assertEqual(status["target_state"], "halted", status)
         self.assertEqual(status["target_state_source"], "gdb_mi")
         self.assertFalse(status["target_state_verified"])
+
+    def test_wait_for_async_stop_keeps_session_and_transcript(self):
+        import base64
+        self.gdb.start(3333)
+        result = self.gdb.command("async", 3333, wait_for_stop_seconds=2)
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(result["stop_event_observed"], result)
+        aid = result["transcript_artifact_id"]
+        self.assertFalse(self.gdb.artifacts.info(aid)["finalized"])
+        self.gdb.close()
+        self.assertTrue(self.gdb.artifacts.info(aid)["finalized"])
+        raw = base64.b64decode(self.gdb.artifacts.chunk(aid)["data_base64"])
+        self.assertIn(b"breakpoint-hit", raw)
+
+    def test_wait_timeout_does_not_destroy_session(self):
+        self.gdb.start(3333)
+        result = self.gdb.command("info registers", 3333, wait_for_stop_seconds=1)
+        self.assertTrue(result["stop_wait_timed_out"])
+        self.assertFalse(self.gdb.status()["session_lost"])
 
     def test_disconnect_blocks_commands(self):
         self.gdb.start(3333)

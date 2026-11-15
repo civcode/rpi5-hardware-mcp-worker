@@ -15,6 +15,8 @@ import subprocess
 import threading
 import time
 
+from artifacts import ArtifactStore
+
 MAX_GDB_OUTPUT = 20000
 MAX_QUEUED_LINES = 4096
 _RESULT_RE = re.compile(r"^(\d+)\^(done|running|connected|error|exit)(?:,|$)")
@@ -41,6 +43,13 @@ class LocalGDB:
         self._token = 0
         self._port: int | None = None
         self._dropped = 0
+        self.artifacts = ArtifactStore()
+        self.transcript_id = None
+        self.transcript_error = None
+        self.transcript_bytes = 0
+        self.transcript_truncated = False
+        self._reader_thread = None
+        self.transcript_limit = 64 * 1024 * 1024
 
     def running(self) -> bool:
         with self._lock:
@@ -64,14 +73,46 @@ class LocalGDB:
                     proc.stdin.close()
                 if proc.stdout:
                     proc.stdout.close()
+            if self._reader_thread is not None:
+                self._reader_thread.join(timeout=3)
+                self._reader_thread = None
             self._lines = queue.Queue(maxsize=MAX_QUEUED_LINES)
             self._dropped = 0
 
+    def _record_line(self, identifier, item):
+        if identifier is None or self.transcript_truncated or self.transcript_error:
+            return
+        data = (item + "\n").encode("utf-8", errors="replace")
+        if self.transcript_bytes + len(data) > self.transcript_limit:
+            self.transcript_truncated = True
+            return
+        try:
+            self.artifacts.append_stream(identifier, data)
+            self.transcript_bytes += len(data)
+        except (OSError, ValueError) as exc:
+            self.transcript_error = str(exc)
+            self.transcript_truncated = True
+
+    def _finish_transcript(self, identifier):
+        if identifier:
+            try:
+                self.artifacts.finalize_stream(identifier, self.transcript_truncated)
+            except (OSError, ValueError) as exc:
+                self.transcript_error = str(exc)
+
+    def transcript_status(self):
+        return {"transcript_artifact_id": self.transcript_id,
+                "transcript_bytes": self.transcript_bytes,
+                "transcript_truncated": self.transcript_truncated,
+                "transcript_error": self.transcript_error}
+
     def _read_output(self, proc: subprocess.Popen, lines: queue.Queue[str | None]) -> None:
+        identifier = self.transcript_id
         try:
             assert proc.stdout is not None
             for line in proc.stdout:
                 item = line.rstrip("\r\n")
+                self._record_line(identifier, item)
                 try:
                     lines.put_nowait(item)
                 except queue.Full:
@@ -85,6 +126,7 @@ class LocalGDB:
                     except queue.Full:
                         self._dropped += 1
         finally:
+            self._finish_transcript(identifier)
             try:
                 lines.put_nowait(None)
             except queue.Full:
@@ -95,6 +137,8 @@ class LocalGDB:
         assert proc is not None and proc.stdin is not None
         self._token += 1
         token = self._token
+        started = time.monotonic()
+        dropped_before = self._dropped
         try:
             proc.stdin.write(f"{token}{mi_command}\n")
             proc.stdin.flush()
@@ -113,7 +157,8 @@ class LocalGDB:
                 break
             if line is None:
                 return {"ok": False, "error": "GDB process closed its output", "session_lost": True,
-                        "output": "".join(visible)[-MAX_GDB_OUTPUT:]}
+                        "output": "".join(visible)[-MAX_GDB_OUTPUT:],
+                        "mi_token": token, **self.transcript_status()}
             raw.append(line)
             stream = _STREAM_RE.match(line)
             if stream:
@@ -130,12 +175,23 @@ class LocalGDB:
         output = "".join(visible)
         response = {
             "ok": result_class in ("done", "connected", "running"),
+            "command_accepted": result_class in ("done", "connected", "running"),
             "result_class": result_class,
             "output": output[-MAX_GDB_OUTPUT:],
             "raw_mi": raw_text[-MAX_GDB_OUTPUT:],
             "truncated": len(output) > MAX_GDB_OUTPUT or len(raw_text) > MAX_GDB_OUTPUT,
             "dropped_lines": self._dropped,
+            "dropped_since_command": self._dropped - dropped_before,
+            "mi_token": token, "elapsed_ms": int((time.monotonic() - started) * 1000),
+            **self.transcript_status(),
         }
+        if response["truncated"]:
+            try:
+                response["output_artifact"] = self.artifacts.save(raw_text.encode("utf-8"), "gdb_mi",
+                    {"mi_token": token, "transcript_artifact_id": self.transcript_id,
+                     "dropped_lines": self._dropped})
+            except (OSError, ValueError) as exc:
+                response["artifact_error"] = str(exc)
         if result_class is None:
             response.update({"error": f"GDB did not complete within {timeout:g}s", "session_lost": True,
                              "target_state": "unknown"})
@@ -161,7 +217,17 @@ class LocalGDB:
         self._process = proc
         self._port = port
         lines = self._lines
-        threading.Thread(target=self._read_output, args=(proc, lines), daemon=True).start()
+        self.transcript_id = None
+        self.transcript_bytes = 0
+        self.transcript_error = None
+        self.transcript_truncated = False
+        try:
+            self.transcript_limit = max(1, int(os.getenv("RPI5_GDB_TRANSCRIPT_MAX_BYTES", str(64 * 1024 * 1024))))
+            self.transcript_id = self.artifacts.begin_stream("gdb_transcript", {"port": port, "pid": proc.pid})
+        except (OSError, ValueError) as exc:
+            self.transcript_error = str(exc)
+        self._reader_thread = threading.Thread(target=self._read_output, args=(proc, lines), daemon=True)
+        self._reader_thread.start()
         for command in ("-gdb-set pagination off", "-gdb-set confirm off",
                         "-gdb-set mi-async on", f"-target-select extended-remote 127.0.0.1:{port}"):
             result = self._send(command, 15)
@@ -187,9 +253,17 @@ class LocalGDB:
                     if line is not None:
                         raw.append(line)
                 payload = "\n".join(raw)
-                return {"ok": self.running(), "output": payload[-MAX_GDB_OUTPUT:],
-                        "truncated": len(payload) > MAX_GDB_OUTPUT, "dropped_lines": self._dropped,
-                        "gdb_running": self.running()}
+                response = {"ok": self.running(), "output": payload[-MAX_GDB_OUTPUT:],
+                            "raw_mi": payload[-MAX_GDB_OUTPUT:],
+                            "truncated": len(payload) > MAX_GDB_OUTPUT, "dropped_lines": self._dropped,
+                            "gdb_running": self.running(), **self.transcript_status()}
+                if response["truncated"]:
+                    try:
+                        response["output_artifact"] = self.artifacts.save(payload.encode("utf-8"), "gdb_mi_poll",
+                            {"transcript_artifact_id": self.transcript_id, "dropped_lines": self._dropped})
+                    except (OSError, ValueError) as exc:
+                        response["artifact_error"] = str(exc)
+                return response
             if self._process is None or self._process.poll() is not None or self._port != port:
                 self.close()
                 started = self._start(port)

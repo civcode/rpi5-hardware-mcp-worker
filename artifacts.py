@@ -43,10 +43,41 @@ class ArtifactStore:
                 raise
         return info
 
+    def begin_stream(self, kind, metadata=None):
+        """Create a persistent live transcript. A crash leaves it unfinalized."""
+        identifier = uuid.uuid4().hex
+        info = {"artifact_id": identifier, "kind": kind, "created_utc": utc_now(),
+                "finalized": False, "metadata": metadata or {}}
+        with self._lock:
+            binary, record = self._paths(identifier)
+            self.directory.mkdir(parents=True, exist_ok=True)
+            binary.touch(exist_ok=False)
+            record.write_text(json.dumps(info) + "\n", encoding="utf-8")
+        return identifier
+
+    def append_stream(self, identifier, data):
+        with self._lock:
+            binary, _ = self._paths(identifier)
+            with binary.open("ab") as stream:
+                stream.write(data)
+
+    def finalize_stream(self, identifier, truncated=False):
+        with self._lock:
+            binary, record = self._paths(identifier)
+            info = json.loads(record.read_text(encoding="utf-8"))
+            data = binary.read_bytes()
+            info.update(finalized=True, length=len(data), truncated=truncated,
+                        sha256=hashlib.sha256(data).hexdigest())
+            temporary = record.with_suffix(".tmp")
+            temporary.write_text(json.dumps(info) + "\n", encoding="utf-8")
+            temporary.replace(record)
+
     def _read(self, identifier):
         binary, record = self._paths(identifier)
         info = json.loads(record.read_text(encoding="utf-8"))
         data = binary.read_bytes()
+        if info.get("artifact_id") == identifier and info.get("finalized") is False:
+            return {**info, "length": len(data), "sha256": hashlib.sha256(data).hexdigest()}, data
         if (info.get("artifact_id") != identifier or info.get("length") != len(data)
                 or info.get("sha256") != hashlib.sha256(data).hexdigest()):
             raise ValueError("Artifact failed integrity verification")
@@ -69,7 +100,8 @@ class ArtifactStore:
                     "length": len(chunk), "total_bytes": info["length"],
                     "next_offset": offset + len(chunk), "eof": offset + len(chunk) == len(data),
                     "data_base64": base64.b64encode(chunk).decode("ascii"),
-                    "chunk_sha256": hashlib.sha256(chunk).hexdigest(), "sha256": info["sha256"]}
+                    "chunk_sha256": hashlib.sha256(chunk).hexdigest(), "sha256": info["sha256"],
+                    "finalized": info.get("finalized", True), "truncated": info.get("truncated", False)}
 
     def list(self, limit=100):
         if type(limit) is not int or not 1 <= limit <= 1000:
@@ -89,6 +121,8 @@ class ArtifactStore:
     def delete(self, identifier):
         with self._lock:
             binary, record = self._paths(identifier)
+            if record.exists() and json.loads(record.read_text(encoding="utf-8")).get("finalized") is False:
+                raise ValueError("Live/unfinalized transcript; stop GDB or remove abandoned files on the Pi")
             exists = binary.exists() or record.exists()
             binary.unlink(missing_ok=True)
             record.unlink(missing_ok=True)

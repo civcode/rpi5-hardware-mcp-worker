@@ -41,6 +41,8 @@ class ManagedGDB(LocalGDB):
         self._exit_code = None
         self._eof = False
         self._event_seq = 0
+        self._stop_seq = 0
+        self._last_stop = None
         self._state = "unknown"
         self._source = None
         self._observed_at = None
@@ -52,15 +54,22 @@ class ManagedGDB(LocalGDB):
         self._observed_at = time.time() if source else None
 
     def _read_output(self, proc, lines) -> None:
+        identifier = self.transcript_id
         try:
             assert proc.stdout is not None
             for line in proc.stdout:
                 item = line.rstrip("\r\n")
+                self._record_line(identifier, item)
                 with self._event_lock:
                     if proc is self._process:
                         if item.startswith(("*running", "*stopped")):
                             self._event_seq += 1
                             state = "running" if item.startswith("*running") else "halted"
+                            if item.startswith("*stopped"):
+                                self._stop_seq += 1
+                                self._last_stop = item
+                                if re.search(r'reason="exited(?:-normally|-signalled)?"', item):
+                                    state = "unknown"
                             self._observe(state, "gdb_mi")
                         elif item.startswith("=thread-group-exited"):
                             self._event_seq += 1
@@ -81,6 +90,7 @@ class ManagedGDB(LocalGDB):
                         if proc is self._process:
                             self._dropped += 1
         finally:
+            self._finish_transcript(identifier)
             with self._event_lock:
                 if proc is self._process:
                     self._eof = True
@@ -132,6 +142,9 @@ class ManagedGDB(LocalGDB):
                     "target_state_verified": active and self._source == "openocd_targets"
                     and self._state in ("running", "halted", "reset", "debug-running"),
                     "session_recreated": False,
+                    "last_stop_event": self._last_stop,
+                    "stop_event_sequence": self._stop_seq,
+                    **self.transcript_status(),
                 }
 
     def close(self, reason: str = "explicit_stop", *, lost: bool = False) -> None:
@@ -168,6 +181,8 @@ class ManagedGDB(LocalGDB):
             self._session_id = uuid.uuid4().hex
             self._exit_code = None
             self._phase = "starting"
+            self._last_stop = None
+            self._stop_seq = 0
             # Parent _start may close the process on initialization failure.
             result = self._start(port)
             if not result["ok"]:
@@ -211,11 +226,14 @@ class ManagedGDB(LocalGDB):
                     **status, "state_probe": result}
 
     def command(self, command: str, port: int, timeout_seconds: int = 30,
-                session_id: str = "", *, require_existing: bool = False) -> dict:
+                session_id: str = "", *, require_existing: bool = False,
+                wait_for_stop_seconds: int = 0) -> dict:
         if type(command) is not str:
             raise ValueError("command must be a string")
         if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 300:
             raise ValueError("timeout_seconds must be an integer from 1 to 300")
+        if type(wait_for_stop_seconds) is not int or not 0 <= wait_for_stop_seconds <= 300:
+            raise ValueError("wait_for_stop_seconds must be 0..300")
         if command.startswith("-") and ("\n" in command or "\r" in command):
             return {"ok": False, "error": "Native MI protocol requests must occupy one line",
                     **self.status()}
@@ -237,6 +255,13 @@ class ManagedGDB(LocalGDB):
             # Parent.command can auto-start, so never call it for nonempty
             # commands: a process dying between check and send must fail closed.
             if not command:
+                if wait_for_stop_seconds:
+                    deadline = time.monotonic() + wait_for_stop_seconds
+                    while time.monotonic() < deadline:
+                        observed = self.status()
+                        if observed["target_state"] == "halted" or observed["session_lost"]:
+                            break
+                        time.sleep(0.01)
                 result = super().command("", port, timeout_seconds)
                 current = self.status()
                 return {**result, **current, "ok": result["ok"] and not current["session_lost"]}
@@ -251,6 +276,7 @@ class ManagedGDB(LocalGDB):
                 # The arbitrary command language can change state. Do not
                 # promote stale observations to evidence for a new command.
                 self._observe("unknown", None)
+                stop_before = self._stop_seq
             result = self._send(mi, timeout_seconds)
             result["command"] = command
             if result.get("session_lost"):
@@ -261,6 +287,20 @@ class ManagedGDB(LocalGDB):
             elif result["ok"] and normalized in _MONITOR_STATE_CHANGES:
                 # Best effort only: GDB may reject a monitor query while running.
                 result["state_probe"] = self._probe_state(min(5, timeout_seconds))
+            if result["ok"] and wait_for_stop_seconds and not result.get("session_lost"):
+                deadline = time.monotonic() + wait_for_stop_seconds
+                observed_stop = False
+                while True:
+                    current = self.status()
+                    if current["stop_event_sequence"] > stop_before:
+                        observed_stop = True
+                        break
+                    if current["session_lost"] or time.monotonic() >= deadline:
+                        break
+                    time.sleep(0.01)
+                result["stop_event_observed"] = observed_stop
+                result["stop_wait_timed_out"] = not observed_stop and not current["session_lost"]
+                # A wait timeout does not close GDB; poll later or send -exec-interrupt.
             current = self.status()
             return {**result, **current, "session_recreated": recreated,
                     "ok": result["ok"] and not current["session_lost"]}

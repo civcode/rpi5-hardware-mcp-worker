@@ -409,7 +409,8 @@ class OpenOCDWorker:
                     **self._gdb_metadata(),
                     "note": "No halt/resume/reset requested; disconnect behavior depends on OpenOCD."}
 
-    def gdb_command(self, command: str, timeout_seconds: int = 30, session_id: str = "") -> dict:
+    def gdb_command(self, command: str, timeout_seconds: int = 30, session_id: str = "",
+                    wait_for_stop_seconds: int = 0) -> dict:
         """Send a command to the owned persistent GDB; never retry after loss."""
         with self._lock:
             metadata = self._gdb_metadata()
@@ -417,7 +418,8 @@ class OpenOCDWorker:
                 return {"ok": False, "error": "OpenOCD server unavailable; start_gdb_server is required",
                         **metadata}
             wrong_host = pi_gdb_file_error(command)
-            result = self._gdb_client.command(command, self._port, timeout_seconds, session_id)
+            result = self._gdb_client.command(command, self._port, timeout_seconds, session_id,
+                                              wait_for_stop_seconds=wait_for_stop_seconds)
             if wrong_host and not result.get("ok"):
                 result["path_hint"] = wrong_host["error"]
             after = self._gdb_metadata()

@@ -39,6 +39,7 @@ logging.getLogger("mcp.server.streamable_http").addFilter(
 worker = OpenOCDWorker()
 artifacts = ArtifactStore()
 serial_worker = SerialWorker(artifacts=artifacts)
+worker._gdb_client.artifacts = artifacts
 atexit.register(worker.close)
 
 
@@ -78,7 +79,8 @@ def diagnose_host() -> dict:
     return {**worker.diagnose_host(), "capabilities": {
         "gdb_cli": True, "gdb_mi": True, "serial_capture": True,
         "serial_modem_control": True, "raw_serial": True, "artifacts": True,
-        "flash_snapshots": True, "flash_region_digests": True}}
+        "flash_snapshots": True, "flash_region_digests": True, "gdb_transcript": True,
+        "gdb_wait_for_stop": True}}
 
 
 @mcp.tool()
@@ -165,12 +167,23 @@ def gdb_session_stop() -> dict:
 
 
 @mcp.tool()
-def gdb_command(command: str, timeout_seconds: int = 30, session_id: str = "") -> dict:
-    """Forward CLI or native MI to Pi-local GDB; empty command polls output.
-    First call can attach; after loss/stop use gdb_session_start explicitly.
-    Pass returned session_id to reject stale-session commands. File paths must
-    exist on the Pi, not Oberon. Raw GDB commands may halt, reset or flash target."""
-    return worker.gdb_command(command, timeout_seconds, session_id)
+def gdb_command(command: str, timeout_seconds: int = 30, session_id: str = "",
+                wait_for_stop_seconds: int = 0) -> dict:
+    """Native GDB CLI or MI (leading '-'), executed on Pi. No command subset. Empty polls async MI.
+    Examples: 'info registers', 'x/16wx 0x20000000', '-exec-continue', '-exec-interrupt',
+    'monitor mdw 0x40004400 1'. Commands may change state; GDB/OpenOCD paths resolve on Pi.
+    First call can attach; after process/command timeout loss or stop, explicitly gdb_session_start.
+    Pass returned session_id to detect stale sessions. MI ^running/^done means command accepted,
+    not proof of halt/resume. For async continue/interrupt, optional wait_for_stop_seconds (0..300)
+    observes a new MI *stopped event without closing GDB on wait timeout; empty poll may wait for
+    cached halted state. Use another call to poll output or interrupt. CLI/MI command result
+    timeout 1..300s closes a wedged session; no replay. Avoid mixing monitor halt/resume with MI
+    register/exec flow: GDB caches can be stale. Prefer native MI exec flow for GDB registers;
+    monitor targets reports OpenOCD state when available. Neither read proves physical RX activity.
+    Raw MI is retained in a session transcript (artifact_info/chunk); live hashes change until
+    finalized. Large inline output is tailed with output_artifact; dropped_lines reports queue loss.
+    Transcript limit defaults 64 MiB, configurable by RPI5_GDB_TRANSCRIPT_MAX_BYTES."""
+    return worker.gdb_command(command, timeout_seconds, session_id, wait_for_stop_seconds)
 
 
 @mcp.tool()
@@ -340,14 +353,16 @@ def serial_exchange(tx_base64: str = "", confirm: str = "", port: str = "",
 
 @mcp.tool()
 def artifact_info(artifact_id: str) -> dict:
-    """Host-only verify persistent artifact length/hash and metadata by returned ID."""
+    """Host-only artifact length/hash and metadata. Immutable artifacts verify stored digest;
+    a live GDB transcript returns the current prefix hash with finalized=false."""
     return artifact_result(artifacts.info, artifact_id)
 
 
 @mcp.tool()
 def artifact_chunk(artifact_id: str, offset: int = 0, length: int = 8192) -> dict:
     """Retrieve verified 1..8192 binary bytes as Base64. Advance byte offset via next_offset,
-    stop at eof, and verify full sha256 after concatenating decoded chunks."""
+    stop at eof, and verify full sha256 after concatenating decoded chunks. For a live GDB
+    transcript eof is current end; hash/length can change until finalized."""
     return artifact_result(artifacts.chunk, artifact_id, offset, length)
 
 
