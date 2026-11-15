@@ -40,6 +40,8 @@ worker = OpenOCDWorker()
 artifacts = ArtifactStore()
 serial_worker = SerialWorker(artifacts=artifacts)
 worker._gdb_client.artifacts = artifacts
+loaded_worker = worker.worker_version()
+serial_worker.worker_revision = loaded_worker["revision"]
 atexit.register(worker.close)
 
 
@@ -75,8 +77,8 @@ mcp = MCPServer(
 @mcp.tool()
 def diagnose_host() -> dict:
     """Host-only Linux/USB/OpenOCD diagnostics, Git revision/branch/dirty state and capabilities.
-    Git metadata and file hashes reflect disk at query time, not proof of a restarted process."""
-    return {**worker.diagnose_host(), "capabilities": {
+    worker reflects disk at query time; loaded_worker records startup revision/source hashes."""
+    return {**worker.diagnose_host(), "loaded_worker": loaded_worker, "capabilities": {
         "gdb_cli": True, "gdb_mi": True, "serial_capture": True,
         "serial_modem_control": True, "raw_serial": True, "artifacts": True,
         "flash_snapshots": True, "flash_region_digests": True, "gdb_transcript": True,
@@ -360,9 +362,9 @@ def artifact_info(artifact_id: str) -> dict:
 
 @mcp.tool()
 def artifact_chunk(artifact_id: str, offset: int = 0, length: int = 8192) -> dict:
-    """Retrieve verified 1..8192 binary bytes as Base64. Advance byte offset via next_offset,
-    stop at eof, and verify full sha256 after concatenating decoded chunks. For a live GDB
-    transcript eof is current end; hash/length can change until finalized."""
+    """Retrieve 1..8192 bytes as Base64 with chunk SHA-256. Advance byte offset via next_offset.
+    Use artifact_info for whole-file verification; verify reassembled bytes against final sha256.
+    Live GDB transcript eof is current end and has no final digest; poll until finalized."""
     return artifact_result(artifacts.chunk, artifact_id, offset, length)
 
 

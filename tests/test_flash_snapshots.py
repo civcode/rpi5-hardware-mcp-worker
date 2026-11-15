@@ -250,5 +250,18 @@ class SnapshotTests(unittest.TestCase):
             analyze_difference(b"abc", b"ab")
 
 
+class RegionDigestTests(unittest.TestCase):
+    def test_application_config_and_full_ranges(self):
+        from flash_snapshots import region_digests
+        data = bytes(range(256)) * 512
+        regions = region_digests(data)["regions"]
+        self.assertEqual(regions["application"]["length"], 78 * 1024)
+        self.assertEqual(regions["config_page"]["sha256"],
+                         hashlib.sha256(data[0x13800:0x13c00]).hexdigest())
+        self.assertEqual(regions["protected_region"]["length"], 50 * 1024)
+        self.assertEqual(regions["full_flash"]["sha256"], hashlib.sha256(data).hexdigest())
+        self.assertIsNone(region_digests(data[:65536])["regions"]["config_page"])
+
+
 if __name__ == "__main__":
     unittest.main()

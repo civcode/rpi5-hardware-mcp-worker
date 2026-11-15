@@ -1,7 +1,6 @@
 """Explicit lifecycle and execution-state observation for the local GDB transport."""
 from __future__ import annotations
 
-import queue
 import re
 import threading
 import time
@@ -75,35 +74,16 @@ class ManagedGDB(LocalGDB):
                             self._event_seq += 1
                             self._observe("unknown", None)
                             self._loss_reason = "GDB inferior exited or disconnected"
-                try:
-                    lines.put_nowait(item)
-                except queue.Full:
-                    try:
-                        lines.get_nowait()
-                    except queue.Empty:
-                        pass
-                    if proc is self._process:
-                        self._dropped += 1
-                    try:
-                        lines.put_nowait(item)
-                    except queue.Full:
-                        if proc is self._process:
-                            self._dropped += 1
+                dropped = lines.put_record(item)
+                if proc is self._process:
+                    self._dropped += dropped
         finally:
-            self._finish_transcript(identifier)
             with self._event_lock:
                 if proc is self._process:
                     self._eof = True
                     self._observe("unknown", None)
-            # Ensure EOF is delivered even if an async event flood filled the queue.
-            try:
-                lines.put_nowait(None)
-            except queue.Full:
-                try:
-                    lines.get_nowait()
-                except queue.Empty:
-                    pass
-                lines.put_nowait(None)
+            lines.put_record(None)
+            self._finish_transcript(identifier)
 
     def status(self) -> dict:
         """Host-only observation: no attach, MI request, reset, halt or resume."""

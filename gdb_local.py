@@ -6,6 +6,7 @@ MI commands when prefixed with '-'. The GDB command language can modify the host
 from __future__ import annotations
 
 import ast
+from collections import deque
 import json
 import os
 import queue
@@ -32,6 +33,39 @@ def _decode_mi_string(encoded: str) -> str:
         return encoded
 
 
+class MIRecordQueue:
+    """Bounded asynchronous previews; never evict a token result in favor of chatter."""
+    def __init__(self, limit=MAX_QUEUED_LINES):
+        self.limit = limit
+        self.records = deque()
+        self.ready = threading.Condition()
+
+    def put_record(self, item):
+        with self.ready:
+            dropped = 0
+            if len(self.records) >= self.limit:
+                index = next((i for i, value in enumerate(self.records)
+                              if value is not None and not _RESULT_RE.match(value)), None)
+                if index is None and item is not None and not _RESULT_RE.match(item):
+                    return 1
+                if index is None:
+                    index = 0
+                del self.records[index]
+                dropped = 1
+            self.records.append(item)
+            self.ready.notify()
+            return dropped
+
+    def get(self, timeout=None):
+        with self.ready:
+            if not self.ready.wait_for(lambda: bool(self.records), timeout=timeout):
+                raise queue.Empty
+            return self.records.popleft()
+
+    def get_nowait(self):
+        return self.get(timeout=0)
+
+
 class LocalGDB:
     """One long-lived GDB process, serialized commands, bounded responses."""
 
@@ -39,7 +73,7 @@ class LocalGDB:
         self.executable = executable or os.getenv("RPI5_GDB", "gdb-multiarch")
         self._lock = threading.RLock()
         self._process: subprocess.Popen | None = None
-        self._lines: queue.Queue[str | None] = queue.Queue(maxsize=MAX_QUEUED_LINES)
+        self._lines: MIRecordQueue = MIRecordQueue()
         self._token = 0
         self._port: int | None = None
         self._dropped = 0
@@ -76,7 +110,7 @@ class LocalGDB:
             if self._reader_thread is not None:
                 self._reader_thread.join(timeout=3)
                 self._reader_thread = None
-            self._lines = queue.Queue(maxsize=MAX_QUEUED_LINES)
+            self._lines = MIRecordQueue()
             self._dropped = 0
 
     def _record_line(self, identifier, item):
@@ -106,31 +140,19 @@ class LocalGDB:
                 "transcript_truncated": self.transcript_truncated,
                 "transcript_error": self.transcript_error}
 
-    def _read_output(self, proc: subprocess.Popen, lines: queue.Queue[str | None]) -> None:
+    def _read_output(self, proc: subprocess.Popen, lines: MIRecordQueue) -> None:
         identifier = self.transcript_id
         try:
             assert proc.stdout is not None
             for line in proc.stdout:
                 item = line.rstrip("\r\n")
                 self._record_line(identifier, item)
-                try:
-                    lines.put_nowait(item)
-                except queue.Full:
-                    try:
-                        lines.get_nowait()
-                    except queue.Empty:
-                        pass
-                    self._dropped += 1
-                    try:
-                        lines.put_nowait(item)
-                    except queue.Full:
-                        self._dropped += 1
+                dropped = lines.put_record(item)
+                if proc is self._process:
+                    self._dropped += dropped
         finally:
+            lines.put_record(None)
             self._finish_transcript(identifier)
-            try:
-                lines.put_nowait(None)
-            except queue.Full:
-                pass
 
     def _send(self, mi_command: str, timeout: float) -> dict:
         proc = self._process

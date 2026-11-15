@@ -81,6 +81,7 @@ class SerialWorker:
             raise SerialError("Invalid serial port configuration")
         # Legacy allow_writes is accepted but no longer gates raw access.
         self.artifacts = artifacts if artifacts is not None else ArtifactStore()
+        self.worker_revision = None
         self._factory = factory
         self._lister = lister
         self._lock = threading.Lock()
@@ -219,7 +220,7 @@ class SerialWorker:
         identity = identity if identity is not None else self._identity(port)
         result = {"ok": True, "port": port, "baudrate": baudrate, **identity,
                   "dtr": dtr, "rts": rts, "modem_lines": "requested, not electrical readback",
-                  "captured_utc": captured_utc or utc_now(),
+                  "captured_utc": captured_utc or utc_now(), "worker_revision": self.worker_revision,
                   "bytes_received": len(data), "rx_sha256": hashlib.sha256(data).hexdigest(), **fields}
         if not data and identity.get("requires_dtr_for_rx") and not dtr:
             result["diagnostic_code"] = "DEBUG_PROBE_DTR_REQUIRED"
@@ -286,6 +287,7 @@ class SerialWorker:
                                            truncated=pre_truncated),
                             "ok": False, "error": "Unsolicited UART output during quiet check; query not sent"}
                 self._write_at_paced(conn, tx)
+                captured = utc_now()
                 rx, terminal, truncated = self._read(conn, timeout_ms, max_bytes, True, timing)
             finally:
                 conn.close()
@@ -364,6 +366,7 @@ class SerialWorker:
             try:
                 captured = utc_now()
                 self._write_at_paced(conn, tx)
+                captured = utc_now()
                 rx, terminal, truncated = self._read(conn, timeout_ms, max_bytes, True, timing)
             finally:
                 conn.close()

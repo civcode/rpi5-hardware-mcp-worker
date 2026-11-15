@@ -95,6 +95,14 @@ class TestLocalGDB(unittest.TestCase):
         self.assertFalse(result['ok'])
         self.assertIn('one line', result['error'])
 
+    def test_preview_queue_preserves_token_under_chatter(self):
+        from gdb_local import MIRecordQueue
+        q = MIRecordQueue(limit=3)
+        q.put_record("17^done")
+        for i in range(20):
+            q.put_record("~\\"chatter\\"")
+        self.assertEqual(q.get_nowait(), "17^done")
+
     def test_no_auth_token_needed(self):
         with patch.dict(os.environ, {"RPI5_GDB_COMMAND_TOKEN": ""}):
             result = self.gdb.command("info registers", 3333)
