@@ -100,7 +100,7 @@ class TestLocalGDB(unittest.TestCase):
         q = MIRecordQueue(limit=3)
         q.put_record("17^done")
         for i in range(20):
-            q.put_record("~\\"chatter\\"")
+            q.put_record('~"chatter"')
         self.assertEqual(q.get_nowait(), "17^done")
 
     def test_no_auth_token_needed(self):

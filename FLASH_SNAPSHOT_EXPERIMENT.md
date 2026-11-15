@@ -22,7 +22,7 @@ The experiment separates three actions:
 
 ## Deployment
 
-Use branch `feat/flash-snapshot-diff` on the Raspberry Pi and restart the
+Use a branch containing flash snapshots (currently `feat/gdb-session-reliability`) on the Raspberry Pi and restart the
 existing worker service once after checkout. No Actions workflows are used.
 The process must have `openocd` installed and access to the CMSIS-DAP
 probe, just as the existing worker does.
@@ -56,7 +56,7 @@ Likewise, stop any **independent** OpenOCD/GDB sessions first.
 | `flash_snapshot_diff(before_id, after_id, label="")` | No | Compare images of equal capacity, write full `diff-*.json` and `diff-*.csv`; return summary and first 64 ranges |
 | `flash_snapshot_diff_chunk(diff_id, format="csv", offset=0, length=4096)` | No | Fetch 1–8192 bytes of a saved CSV/JSON diff report as Base64 with hashes |
 
-The tool produces a 128-KiB image (if the target reports 128 KiB), or a
+Snapshots now also report named region digests (full flash, application, configuration page and protected region) from the same binary. The tool produces a 128-KiB image (if the target reports 128 KiB), or a
 64-KiB image (if it reports 64 KiB). Capture files never include STM32
 option bytes or DW3000 OTP, and the SDK's presumed configuration sector 78
 is **not** hard-coded as the only region checked.

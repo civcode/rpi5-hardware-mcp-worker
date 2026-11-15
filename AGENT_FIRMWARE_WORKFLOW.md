@@ -37,7 +37,7 @@ No shell access to the Pi is required. Staging and programming are independent s
    `capacity_status=NOT_PROBED_HOST_ONLY`. **`flash_hex` performs a fresh
    factory-capacity probe before programming.**
 6. When the experiment calls for programming, the current convenience endpoint is
-   `flash_hex(artifact_id, confirm_sha256, confirm="FLASH")`. A verified recovery image is recommended. It checks
+   `flash_hex(artifact_id, confirm_sha256)`. Legacy confirm is ignored. A verified recovery image is recommended. It checks
    the preflight, probe ownership, SHA-256, capacity, then performs
    `reset halt` before programming and requests verify/reset.
    A successful staging or preflight result does not demonstrate that programming has occurred or will succeed.
@@ -46,8 +46,9 @@ No shell access to the Pi is required. Staging and programming are independent s
    Never infer a hardware PASS from a successful compile or ELF link alone.
 
 The app/config boundary for this project's Board A build is
-`0x08013800`; `flash_preflight` and `flash_hex` reject staged images
-that extend into `[0x08013800, 0x08020000)`. The protected-range check
+`0x08013800`; `flash_preflight` and `flash_hex` warn and default to refusing images
+that extend into `[0x08013800, 0x08020000)`. Pass `allow_protected=true` to both
+for an experiment that intentionally programs this region. The protected-range check
 examines the image's highest addressed data byte. This is a **data-range
 check**, not proof that the MCU's physical erase granularity leaves saved
 configuration intact. Recovery/config backups are useful when the experiment requires preservation or rollback. These checks apply to the convenience endpoints, not native GDB/OpenOCD.
@@ -79,7 +80,7 @@ monitor reset run
 Use the actual OpenOCD host/port returned by the MCP deployment. The
 `gdb_command` MCP tool instead talks to **GDB running on the Pi**: all
 `file`, `symbol-file`, and `load <path>` paths must exist on the Pi.
-A tool error `GDB_FILE_NOT_ON_PI` means that condition was not met.
+A failed command may include the diagnostic `path_hint` with code `GDB_FILE_NOT_ON_PI`; the command is still forwarded to native GDB.
 Similarly, a `monitor flash write_image` file path is resolved by OpenOCD
 **on the Pi**, not on Oberon. Choose each path according to the host executing the command.
 
@@ -94,7 +95,7 @@ before using standalone MCP `flash_hex`; don't run both at once.
 - `UPLOAD_SHA256_MISMATCH`: the staged bytes do not match the intended digest; regenerate or inspect the transport.
 - `HEX_MISSING_EOF` / `HEX_NO_DATA`: inspect the **decoded** payload and
   confirm the input was original HEX bytes, not a path or other content.
-- `IMAGE_OVERLAPS_PROTECTED_FLASH`: the current staged-image endpoint rejects this range. Check the linker/image for an app-only operation; native GDB/OpenOCD is a separate interface when a different range is intentional.
+- `IMAGE_OVERLAPS_PROTECTED_FLASH`: the default app-only plan rejects this range. Check the linker/image or pass `allow_protected=true` when intentional; native GDB/OpenOCD is also available.
 - `GDB_SERVER_OWNS_PROBE`: stop GDB server or use the intentionally selected
   GDB workflow. Never launch a competing OpenOCD session.
 - `probe_target`, `fault_snapshot`, and GDB halt commands can **halt the MCU**
