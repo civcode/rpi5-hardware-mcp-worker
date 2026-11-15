@@ -12,6 +12,7 @@ from firmware_upload import UploadError
 from flash_snapshots import snapshot_tool_result
 from worker_lifecycle import run_with_cleanup
 from serial_core import SerialWorker, serial_tool_result
+from artifacts import ArtifactStore, artifact_result
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -36,7 +37,8 @@ logging.getLogger("mcp.server.streamable_http").addFilter(
 )
 
 worker = OpenOCDWorker()
-serial_worker = SerialWorker(allow_writes=os.getenv("RPI5_SERIAL_ENABLE_WRITES") == "1")  # Raw serial_exchange only
+artifacts = ArtifactStore()
+serial_worker = SerialWorker(artifacts=artifacts)
 atexit.register(worker.close)
 
 
@@ -62,12 +64,10 @@ def _firmware_tool_result(fn, *args):
 
 mcp = MCPServer(
     "rpi5-hardware",
-    instructions=("USB CMSIS-DAP/OpenOCD and UART/AT tools for STM32F103 BU03/BU04. "
-                  "SWD probes halt the MCU; flashing requires explicit SHA-256 confirmation. "
-                  "AT queries use a read-only command allowlist. AT setters and "
-                  "SAVE use validated, length-bounded, byte-paced UART without an unlock "
-                  "or confirmation argument. Unrestricted raw UART still requires "
-                  "RPI5_SERIAL_ENABLE_WRITES=1 and confirm='SEND'."),
+    instructions=("Rapid experimentation with native GDB CLI/MI, OpenOCD and raw UART. "
+                  "Choose operations using tool descriptions; SWD may halt and serial/programming commands may change state. "
+                  "Debug Probe UART normally needs dtr=true. CH340 RTS may control NRST on BU04. "
+                  "One OpenOCD process owns the probe at a time."),
 )
 
 
@@ -274,39 +274,87 @@ def flash_hex(artifact_id: str, confirm_sha256: str, confirm: str = "", speed_kh
 
 @mcp.tool()
 def serial_list_ports() -> dict:
-    """List configured USB serial ports and presence/USB identifiers, no transmit."""
+    """Discover available and configured default UART ports, USB identities and adapter hints.
+    No port is opened. Explicit /dev/ paths are accepted; prefer persistent by-id paths."""
     return serial_tool_result(serial_worker.serial_list_ports)
 
 
 @mcp.tool()
-def serial_capture(port: str = "", baudrate: int = 115200,
-                   duration_ms: int = 1000, max_bytes: int = 4096) -> dict:
-    """Listen for UART bytes for a bounded interval, without transmitting bytes."""
-    return serial_tool_result(serial_worker.serial_capture, port, baudrate, duration_ms, max_bytes)
+def serial_capture(port: str = "", baudrate: int = 115200, duration_ms: int = 1000,
+                   max_bytes: int = 4096, dtr: bool = False, rts: bool = False,
+                   store: bool = False) -> dict:
+    """Receive without transmitting. 8N1; duration 1..60000 ms, max_bytes 1..1048576.
+    Empty port selects configured default. DTR/RTS are requested before open; drivers may glitch.
+    Debug Probe 2e8a:000c normally requires dtr=true (no physical DTR pin).
+    On BU04 CH340C, RTS assertion may hold NRST in reset. Agent selects settings.
+    Example: port='/dev/ttyACM0', dtr=true, duration_ms=20000, max_bytes=262144, store=true.
+    <=16 KiB returns inline raw views; larger data or store=true persists binary artifact.
+    Use artifact_chunk and verify rx_sha256. elapsed_ms is receive window, offsets are host read
+    times, truncated means byte cap reached. Zero bytes does not prove target silence."""
+    return serial_tool_result(serial_worker.serial_capture, port, baudrate, duration_ms, max_bytes,
+                              dtr, rts, store)
 
 
 @mcp.tool()
 def serial_at_query(command: str, port: str = "", baudrate: int = 115200,
                     timeout_ms: int = 2500, max_bytes: int = 4096,
-                    quiet_ms: int = 150) -> dict:
-    """Send allowlisted AT query, <=61 ASCII bytes + CRLF, paced at 5 ms per byte."""
-    return serial_tool_result(serial_worker.serial_at_query, command, port, baudrate, timeout_ms, max_bytes, quiet_ms)
+                    quiet_ms: int = 150, dtr: bool = False, rts: bool = False) -> dict:
+    """Stock AT convenience query: allowlisted AT/GET commands, <=61 ASCII bytes + CRLF,
+    paced 5 ms/byte, quiet check before transmission, terminal OK/ERROR. Inspect raw response
+    when chatty or incomplete. For arbitrary protocols use serial_exchange. See serial_capture
+    for DTR/RTS and adapter behavior."""
+    return serial_tool_result(serial_worker.serial_at_query, command, port, baudrate,
+                              timeout_ms, max_bytes, quiet_ms, dtr, rts)
 
 
 @mcp.tool()
-def serial_at_command(command: str, port: str = "",
-                      baudrate: int = 115200, timeout_ms: int = 2500,
-                      max_bytes: int = 4096) -> dict:
-    """Send AT setter/save directly; <=61 ASCII bytes + CRLF, paced 5 ms/byte."""
-    return serial_tool_result(serial_worker.serial_at_command, command, port, baudrate, timeout_ms, max_bytes)
+def serial_at_command(command: str, port: str = "", baudrate: int = 115200,
+                      timeout_ms: int = 2500, max_bytes: int = 4096,
+                      dtr: bool = False, rts: bool = False) -> dict:
+    """Stock AT convenience: <=61 ASCII bytes + CRLF, paced 5 ms/byte. Setters and SAVE
+    can change settings, flash or reset. Terminal OK is not proof of target state. Use
+    serial_exchange for arbitrary frames/pacing; DTR/RTS as in serial_capture."""
+    return serial_tool_result(serial_worker.serial_at_command, command, port, baudrate,
+                              timeout_ms, max_bytes, dtr, rts)
 
 
 @mcp.tool()
-def serial_exchange(tx_base64: str, confirm: str = "", port: str = "",
-                    baudrate: int = 115200, timeout_ms: int = 1000,
-                    max_bytes: int = 4096) -> dict:
-    """Opt-in bounded raw UART transmit; require confirm='SEND'."""
-    return serial_tool_result(serial_worker.serial_exchange, tx_base64, confirm, port, baudrate, timeout_ms, max_bytes)
+def serial_exchange(tx_base64: str = "", confirm: str = "", port: str = "",
+                    baudrate: int = 115200, timeout_ms: int = 1000, max_bytes: int = 4096,
+                    dtr: bool = False, rts: bool = False, inter_byte_delay_ms: int = 0,
+                    store: bool = False) -> dict:
+    """General-purpose raw UART; no write flag or confirmation. Legacy confirm ignored.
+    Base64 0..65536 bytes (empty = receive only), no appended CRLF. Optional pacing 0..1000 ms
+    with total requested delay <=60 s. timeout_ms 1..60000 is RX window after TX.
+    max_bytes 1..1048576. See serial_capture for modem lines, artifact and timing details.
+    A failed write may have partially transmitted. Example tx_base64='QVQNCg==' sends AT CRLF."""
+    return serial_tool_result(serial_worker.serial_exchange, tx_base64, confirm, port, baudrate,
+                              timeout_ms, max_bytes, dtr, rts, inter_byte_delay_ms, store)
+
+
+@mcp.tool()
+def artifact_info(artifact_id: str) -> dict:
+    """Host-only verify persistent artifact length/hash and metadata by returned ID."""
+    return artifact_result(artifacts.info, artifact_id)
+
+
+@mcp.tool()
+def artifact_chunk(artifact_id: str, offset: int = 0, length: int = 8192) -> dict:
+    """Retrieve verified 1..8192 binary bytes as Base64. Advance byte offset via next_offset,
+    stop at eof, and verify full sha256 after concatenating decoded chunks."""
+    return artifact_result(artifacts.chunk, artifact_id, offset, length)
+
+
+@mcp.tool()
+def artifact_list(limit: int = 100) -> dict:
+    """List saved artifacts (1..1000 recent entries), no hardware access."""
+    return artifact_result(artifacts.list, limit)
+
+
+@mcp.tool()
+def artifact_delete(artifact_id: str) -> dict:
+    """Delete exactly the specified persistent artifact and its metadata, host-only."""
+    return artifact_result(artifacts.delete, artifact_id)
 
 
 if __name__ == "__main__":

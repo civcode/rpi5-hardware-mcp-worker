@@ -64,13 +64,13 @@ class SerialCoreTests(unittest.TestCase):
         return SerialWorker(ports=("/dev/ttyUSB0",), factory=factory,
                             lister=lambda: [], allow_writes=allow_writes), instances
 
-    def test_reject_nonallowlisted_device_before_open(self):
+    def test_accept_explicit_device_reject_url(self):
         worker, instances = self.make_worker()
-        with self.assertRaises(SerialError):
-            worker.serial_capture(port="/dev/ttyACM0")
+        self.assertTrue(worker.serial_capture(port="/dev/ttyACM0", duration_ms=1)["ok"])
+        self.assertEqual(instances[0].port, "/dev/ttyACM0")
         with self.assertRaises(SerialError):
             worker.serial_at_query(command="AT", port="socket://evil")
-        self.assertEqual(instances, [])
+        self.assertEqual(len(instances), 1)
 
     def test_reject_bad_port_config(self):
         for value in ("", "../../tmp", "/dev/../etc/passwd", "/dev/ttyUSB0\n/dev/ttyUSB1"):
@@ -141,19 +141,12 @@ class SerialCoreTests(unittest.TestCase):
         self.assertEqual(result["rx_hex"], "00fe0d0a")
         self.assertFalse(instances[0].writes)
 
-    def test_write_default_disabled_and_confirm_required(self):
+    def test_raw_exchange_needs_no_confirmation(self):
         worker, instances = self.make_worker()
         payload = base64.b64encode(b"AT+RESTORE\r\n").decode()
-        with self.assertRaises(SerialError):
-            worker.serial_exchange(payload, confirm="SEND")
-        self.assertEqual(instances, [])
-        enabled, enabled_instances = self.make_worker(allow_writes=True)
-        with self.assertRaises(SerialError):
-            enabled.serial_exchange(payload)
-        self.assertEqual(enabled_instances, [])
-        result = enabled.serial_exchange(payload, confirm="SEND", timeout_ms=50)
+        result = worker.serial_exchange(payload, timeout_ms=1)
         self.assertTrue(result["transmitted"])
-        self.assertEqual(enabled_instances[0].writes, [b"AT+RESTORE\r\n"])
+        self.assertEqual(b"".join(instances[0].writes), b"AT+RESTORE\r\n")
 
     def test_at_command_needs_no_confirmation_or_service_switch(self):
         # The stock setter and SAVE work with the default worker config.
@@ -178,12 +171,12 @@ class SerialCoreTests(unittest.TestCase):
         params = inspect.signature(SerialWorker.serial_at_command).parameters
         self.assertNotIn("confirm", params)
 
-    def test_raw_exchange_remains_service_gated(self):
-        worker, instances = self.make_worker()
-        payload = base64.b64encode(b"AT+SAVE\r\n").decode("ascii")
-        with self.assertRaisesRegex(SerialError, "disabled"):
-            worker.serial_exchange(payload, confirm="SEND")
-        self.assertEqual(instances, [])
+    def test_empty_raw_exchange_is_receive_only(self):
+        worker, instances = self.make_worker(pre=b"raw")
+        result = worker.serial_exchange(timeout_ms=1, dtr=True, rts=True)
+        self.assertFalse(result["transmitted"])
+        self.assertEqual(instances[0].wire_settings, (True, True))
+        self.assertEqual(instances[0].writes, [])
 
     def test_at_frame_length_boundary_before_open(self):
         worker, instances = self.make_worker(allow_writes=True)
@@ -238,9 +231,9 @@ class SerialCoreTests(unittest.TestCase):
     def test_oversized_write_and_bounds(self):
         worker, instances = self.make_worker(allow_writes=True)
         with self.assertRaises(SerialError):
-            worker.serial_exchange(base64.b64encode(b"a" * 257).decode(), "SEND")
+            worker.serial_exchange(base64.b64encode(b"a" * 65537).decode(), "SEND")
         with self.assertRaises(SerialError):
-            worker.serial_capture(duration_ms=10001)
+            worker.serial_capture(duration_ms=60001)
         with self.assertRaises(SerialError):
             worker.serial_capture(baudrate=True)
         self.assertEqual(instances, [])
@@ -283,6 +276,29 @@ class SerialCoreTests(unittest.TestCase):
         worker, _ = self.make_worker()
         result = worker.serial_list_ports()
         self.assertEqual([p["port"] for p in result["allowed"]], ["/dev/ttyUSB0"])
+
+
+    def test_capture_hint_and_artifact(self):
+        import hashlib
+        import tempfile
+        from types import SimpleNamespace
+        from artifacts import ArtifactStore
+        with tempfile.TemporaryDirectory() as directory:
+            worker, _ = self.make_worker()
+            worker._lister = lambda: [SimpleNamespace(device="/dev/ttyUSB0", vid=0x2e8a, pid=12)]
+            self.assertEqual(worker.serial_capture(duration_ms=1)["diagnostic_code"],
+                             "DEBUG_PROBE_DTR_REQUIRED")
+            data = b"x" * 20000
+            worker, instances = self.make_worker(pre=data)
+            worker.artifacts = ArtifactStore(directory)
+            result = worker.serial_capture(duration_ms=100, max_bytes=len(data), dtr=True)
+            self.assertEqual(instances[0].wire_settings, (True, False))
+            self.assertEqual(result["ended"], "max_bytes")
+            self.assertEqual(result["rx_sha256"], hashlib.sha256(data).hexdigest())
+            aid = result["artifact"]["artifact_id"]
+            self.assertTrue(result["inline_omitted"])
+            self.assertEqual(worker.artifacts.info(aid)["length"], len(data))
+            self.assertEqual(base64.b64decode(worker.artifacts.chunk(aid)["data_base64"]), data[:8192])
 
 
 if __name__ == "__main__":
