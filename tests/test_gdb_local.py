@@ -46,6 +46,8 @@ class TestLocalGDB(unittest.TestCase):
         self.executable.write_text(STUB.format(python=os.sys.executable))
         self.executable.chmod(0o755)
         self.gdb = LocalGDB(executable=str(self.executable))
+        from artifacts import ArtifactStore
+        self.gdb.artifacts = ArtifactStore(self.tmp.name)
 
     def tearDown(self):
         self.gdb.close()
@@ -92,6 +94,14 @@ class TestLocalGDB(unittest.TestCase):
         result = self.gdb.command('-exec-continue\n-exec-interrupt', 3333)
         self.assertFalse(result['ok'])
         self.assertIn('one line', result['error'])
+
+    def test_preview_queue_preserves_token_under_chatter(self):
+        from gdb_local import MIRecordQueue
+        q = MIRecordQueue(limit=3)
+        q.put_record("17^done")
+        for i in range(20):
+            q.put_record('~"chatter"')
+        self.assertEqual(q.get_nowait(), "17^done")
 
     def test_no_auth_token_needed(self):
         with patch.dict(os.environ, {"RPI5_GDB_COMMAND_TOKEN": ""}):

@@ -1,8 +1,21 @@
 # Raspberry Pi 5 hardware MCP worker
 
-A **plain-LAN-HTTP** Model Context Protocol worker for Raspberry Pi 5 hardware access: OpenOCD/SWD through the Raspberry Pi Debug Probe and USB-UART/AT commands (default allowed ports `/dev/ttyUSB0` and `/dev/ttyACM0`) for the STM32F103 BU03/BU04 UWB kit.
+A **plain-LAN-HTTP** Model Context Protocol worker for Raspberry Pi 5 hardware access: OpenOCD/SWD through the Raspberry Pi Debug Probe and USB-UART/AT commands (default ports `/dev/ttyUSB0` and `/dev/ttyACM0`) for the STM32F103 BU03/BU04 UWB kit.
 
-This is **not** a replacement for GDB or OpenOCD. The worker runs OpenOCD **on the Pi**, offers a few Pi coding agent tools, and starts/stops an OpenOCD **GDB TCP server on port 3333**. GDB on the Oberon workstation can connect directly to `edge.local:3333` and use the **local ATfE ELF with symbols**. It does not require SSH, TLS, a service manager, or a checkout of the SDK on the Pi. UART uses `pyserial` and shares the existing MCP endpoint.
+This is **not** a replacement for GDB or OpenOCD. The worker runs OpenOCD **on the Pi**, exposes native debugging capabilities and supporting MCP tools, and starts/stops an OpenOCD **GDB TCP server on port 3333**. GDB on the Oberon workstation can connect directly to `edge.local:3333` and use the **local ATfE ELF with symbols**. It does not require SSH, TLS, a service manager, or a checkout of the SDK on the Pi. UART uses `pyserial` and shares the existing MCP endpoint.
+
+## Architecture and Design Philosophy
+
+This is an **agent-oriented rapid-prototyping and hardware experimentation tool**. Its purpose is to maximize the agent's action space through broad, reliable native GDB/OpenOCD access and, where implemented, raw UART access. The worker provides capabilities and information; the agent chooses experiments, commands and recovery strategies.
+
+- Prefer native, general-purpose interfaces over narrow operation-specific wrappers.
+- Treat MCP tool descriptions as an operating manual: explain parameters, defaults, examples, side effects, hardware quirks, observations and recovery options.
+- Prefer informative warnings and configurable defaults to unnecessary restrictions or mandatory experimental workflows.
+- Manage technical constraints such as exclusive probe ownership, transport, session lifecycle and data integrity; do not impose the experiment's methodology.
+- Preserve raw results and metadata, distinguish observations from assumptions, and avoid silent state changes or command replay.
+- Keep abstractions minimal. Convenience tools complement, not replace, native access.
+
+Plain LAN HTTP is intentional. Connection security, authentication and TLS are outside scope. See [AGENTS.md](AGENTS.md) for the full design principles and development guidance. Current tool-specific checks described below are implementation behavior, not a project-wide policy; board-specific examples are recommendations for those experiments.
 
 ## Architecture
 
@@ -33,15 +46,14 @@ Diffs return changed pages/ranges and write exhaustive JSON and CSV with
 per-byte old/new values and candidate little-endian numeric interpretations.
 The chunk APIs retrieve saved binaries/reports over MCP without requiring SSH.
 
-Both guarded AT endpoints (`serial_at_query` and `serial_at_command`)
+Both AT convenience endpoints (`serial_at_query` and `serial_at_command`)
 reject commands over **61 printable ASCII bytes**, because they append CRLF and
 the historical STM32 receive buffer wraps at a 64-byte frame. Commands are
 transmitted **one byte at a time**, with a 5 ms inter-byte pause and a
 transmitter flush after each byte, matching the historical host workaround.
 These are conservative 2024-source constraints, not a measurement of the
 binary-only 2026 firmware. The generic `serial_exchange` raw endpoint does
-**not** apply these AT protections and must not be used for AT configuration
-experiments.
+**not** apply these AT-specific checks. Prefer the convenience endpoints for ordinary stock configuration; raw exchange remains available for experiments that intentionally vary framing or pacing (subject to its current startup and call parameters).
 
 For a controlled one-setting-at-a-time stock firmware experiment, see
 **[FLASH_SNAPSHOT_EXPERIMENT.md](FLASH_SNAPSHOT_EXPERIMENT.md)**. Sending
@@ -89,64 +101,131 @@ The Raspberry Pi 5 is named `edge`; use its LAN/mDNS hostname `edge.local`, or i
 
 | Tool | Effect |
 | --- | --- |
-| `diagnose_host` | Read-only Pi host/USB/OpenOCD diagnostics, no target contact |
+| `diagnose_host` | Pi host/USB/OpenOCD diagnostics, startup/disk source identity and capabilities; no target contact |
 | `inspect_openocd_host` | Host-only executable hash/version and fixed candidate OpenOCD script contents; no target access |
 | `probe_target` | **Halts MCU**, reads target ID and flash capacity; no erase/program |
 | `fault_snapshot` | **Halts MCU** and reads fault status; CPU-register values are not yet reliably returned by the current tool (see verified findings below). No reset/program |
 | `start_gdb_server` | Start one persistent OpenOCD process for remote GDB on `:3333` |
 | `gdb_server_status` | Report server state, PID and recent OpenOCD logs |
-| `gdb_command` | Persistent GDB console/MI command transport; no token required |
+| `gdb_command` | Persistent GDB console/MI; optional session_id guard; no silent reattach after loss |
+| `gdb_session_start` / `gdb_session_stop` | Explicit local GDB attach/disconnect; OpenOCD managed separately |
+| `gdb_session_status` | Host-only session identity, GDB/OpenOCD PIDs, loss diagnostics and last observed state |
+| `target_execution_status` | Cached observation by default; optionally query OpenOCD targets through existing GDB |
+| `target_reset` | Convenience reset run/halt in active GDB session; acceptance separate from observed state |
+| `firmware_fingerprint` | Hash exact flash range; return full/application/config/protected region digests from same snapshot |
 | `stop_gdb_server` | Stop persistent OpenOCD process |
-| `begin_firmware_upload` | Create host-only bounded chunked upload; original byte count and SHA-256 required |\n| `upload_firmware_chunk` | Transfer 1–8192 original bytes as Base64 at an exact byte offset; identical retry safe |\n| `finalize_firmware_upload` / `abort_firmware_upload` | Validate complete HEX and stage an artifact, or abort partial upload; no target access |\n| `flash_preflight` | Rehash staged artifact and check protected flash/config boundary plus probe ownership; host-only, capacity probe deferred |\n| `stage_hex` | Stage an Intel HEX image sent as base64; checks checksums, address range and SHA-256; **does not flash** |
+| `begin_firmware_upload` | Create host-only bounded chunked upload; original byte count and SHA-256 required |
+| `upload_firmware_chunk` | Transfer 1–8192 original bytes as Base64 at an exact byte offset; identical retry safe |
+| `finalize_firmware_upload` / `abort_firmware_upload` | Validate complete HEX and stage an artifact, or abort partial upload; no target access |
+| `flash_preflight` | Rehash staged artifact and check protected flash/config boundary plus probe ownership; host-only, capacity probe deferred |
+| `stage_hex` | Stage an Intel HEX image sent as base64; checks checksums, address range and SHA-256; **does not flash** |
 | `staged_hex_info` | Rehash a staged HEX and return its generated OpenOCD path; **does not access the target** |
-| `flash_hex` | Destructive: probe capacity, **erase/program/verify/reset** a staged image, only with matching SHA-256 plus `confirm="FLASH"` |
+| `flash_hex` | Probe capacity, erase/program/verify/reset staged HEX with matching SHA-256; optional `allow_protected=true` for config overlap |
 | `serial_list_ports` | List configured USB serial devices and presence |
-| `serial_capture` | Bounded UART receive without transmission |
+| `serial_capture` | Receive without TX, explicit modem lines, up to 60 s/1 MiB, optional stored raw artifact |
 | `serial_at_query` | Bounded read-only AT query, complete response and raw bytes |
 | `serial_at_command` | AT setters and `AT+SAVE`, no startup unlock or confirmation argument; AT length and pacing guards remain |
-| `serial_exchange` | Raw Base64 UART transmit, still disabled unless `RPI5_SERIAL_ENABLE_WRITES=1` and `confirm="SEND"` |
+| `serial_exchange` | General raw Base64 UART RX/TX with optional pacing/DTR/RTS; no write gate |
+| `artifact_info` / `artifact_chunk` | Verify metadata and retrieve binary artifacts in chunks |
+| `artifact_list` / `artifact_delete` | Inspect or remove stored artifacts without hardware access |
 
-`staged_hex_info(artifact_id)` reports the generated path only while the worker and staged artifact exist, after rechecking the file hash; it accepts no user path. A worker restart may invalidate the ID and delete its temporary files. The path is not authorization to program; any future GDB/OpenOCD programming commands require separate review and explicit approval.
+`staged_hex_info(artifact_id)` reports the generated path only while the worker and staged artifact exist, after rechecking the file hash; it accepts no user path. A worker restart may invalidate the ID and delete its temporary files. The path identifies a Pi-local staged file; native GDB/OpenOCD programming commands are separate operations with their own effects. Staging itself does not program.
 
 `inspect_openocd_host()` reads only a fixed list of script filenames under `OPENOCD_SCRIPTS`, `/usr/local/share/openocd/scripts` and `/usr/share/openocd/scripts`, and runs the configured OpenOCD executable only with `--version`. It returns candidate contents and hashes, not proof of the active search order, embedded Tcl, build source, or deployed flash-driver behavior. No arbitrary file path or command can be supplied.
 
 The optional `quirk=true` parameter requests OpenOCD CMSIS-DAP single-packet compatibility mode (if supported by installed OpenOCD). `speed_khz` defaults to **100** to debug unreliable links. Official probe firmware v2.3.1 or v2.2.3 may be useful as a comparison when diagnosing Pi 5-specific issues.
 
-**Firmware upload for agents:** use `begin_firmware_upload` → `upload_firmware_chunk` (Base64 pieces up to 8192 original bytes, byte offsets) → `finalize_firmware_upload` → `flash_preflight`. These steps are **host-only**, do not halt the STM32 and do not program flash. Only a separate, explicitly confirmed `flash_hex` operation can erase/program/reset after verifying staged SHA-256, protected image boundary and actual factory flash capacity. The former single-shot `stage_hex` remains for compatibility but is not recommended for 200-KB+ HEX through agent tool calls. See [AGENT_FIRMWARE_WORKFLOW.md](AGENT_FIRMWARE_WORKFLOW.md) for exact multi-host instructions, error codes and failure recovery.
+**Firmware upload for agents:** use `begin_firmware_upload` → `upload_firmware_chunk` (Base64 pieces up to 8192 original bytes, byte offsets) → `finalize_firmware_upload` → `flash_preflight`. These steps are **host-only**, do not halt the STM32 and do not program flash. `flash_hex` checks the expected staged SHA-256 and physical flash capacity before programming; `allow_protected=true` explicitly permits intentional overlap with the historical BU04 configuration region. Legacy `confirm` is accepted but ignored. Native GDB/OpenOCD commands are an alternative and are not governed by that endpoint's checks. The former single-shot `stage_hex` remains for compatibility but is not recommended for 200-KB+ HEX through agent tool calls. See [AGENT_FIRMWARE_WORKFLOW.md](AGENT_FIRMWARE_WORKFLOW.md) for exact multi-host instructions, error codes and failure recovery.
 
-**GDB alternative:** run GDB **on Oberon** with the local `Project.elf` and connect to OpenOCD **on the Pi**, then `load` only with flash authorization. The MCP `gdb_command` tool instead runs GDB **on the Pi**; it cannot open Oberon-local worktree paths. An OpenOCD `monitor flash write_image` filename likewise resolves on the Pi. Do not mix these workflows.
+**GDB alternative:** run GDB **on Oberon** with the local `Project.elf` and connect to OpenOCD **on the Pi**, then `load` if programming is part of the experiment. The MCP `gdb_command` tool instead runs GDB **on the Pi**; it cannot open Oberon-local worktree paths. An OpenOCD `monitor flash write_image` filename likewise resolves on the Pi. Select paths according to the host executing each command.
 
 ### MCP GDB command transport
 
-The `gdb_command(command, timeout_seconds=30)` tool forwards GDB
-console commands or native MI commands (prefixed with `-`) through a persistent
-`gdb-multiarch` session on the Pi. Start OpenOCD using `start_gdb_server` first.
-Use an empty command to poll pending MI output; `stop_gdb_server` ends the session.
+OpenOCD and the Pi-local GDB client are separate processes. Start OpenOCD with
+`start_gdb_server`, then call `gdb_session_start` to attach (may halt the MCU).
+For compatibility, the first nonempty `gdb_command` can still attach lazily in
+a newly started server epoch. **After timeout, unexpected exit, disconnect or
+explicit stop, commands fail closed until explicit `gdb_session_start`.**
+Commands are never automatically replayed.
 
-No token or command allowlist is required. Commands can affect the Pi and
-MCU, including writing memory or programming flash. The MCP HTTP endpoint
-is plaintext and should remain reachable only from the protected development
-network. Avoid exposing port 8766 to untrusted clients.
-On a command timeout the client session is closed and the target state is unknown.
+- Record `session_id`, `gdb_pid` and `openocd_pid`. Pass `session_id` with
+  subsequent commands to reject stale requests, including across worker
+  restarts. Explicit reattach returns a new identity and `session_recreated: true`.
+- `gdb_session_status` and `gdb_server_status` report health without attaching
+  or sending protocol commands. `last_gdb_pid`, `gdb_exit_code` and
+  `session_loss_reason` are best-effort diagnostics.
+- CLI/native MI commands run on the Pi. An empty command polls pending MI output
+  without initiating a session. Raw commands remain unrestricted; Pi file-path diagnostics are hints on failed commands, not preflight refusals.
+- Use native `-exec-continue` / `-exec-interrupt` for GDB-managed execution. A MI result such as `^running` or `^done` is acceptance, not proof of a stop. `wait_for_stop_seconds=1..300` optionally observes a new MI `*stopped` event; a wait timeout keeps the session. An empty poll can also wait for a cached halted state. Poll again for later output; commands are serialized, so do not wait in one call if you need another call to interrupt it. A command-result timeout (1..300 s) still closes the uncertain GDB session, without replay.
+- Avoid mixing OpenOCD `monitor halt`/`monitor resume` with GDB register caches and MI exec commands: the two state machines may disagree. Use GDB-native execution for register inspection; use `monitor targets` for an OpenOCD observation. Neither is a guarantee of subsequent hardware state.
+- Each GDB session records normalized UTF-8 MI records to `transcript_artifact_id` (default maximum 64 MiB, configurable with `RPI5_GDB_TRANSCRIPT_MAX_BYTES`). Large command/poll previews also expose `output_artifact`. Preview queue overflow counts `dropped_lines`; consult the session transcript, and check `transcript_truncated` / `transcript_error`.
+- `gdb_session_stop` terminates local GDB only. `stop_gdb_server` stops both.
+  Neither explicitly requests halt/resume/reset; OpenOCD disconnect handling
+  can nevertheless affect execution. Do not use a concurrent external GDB client.
+- `target_execution_status()` is a cached observation, not a live guarantee.
+  Async MI records are tracked between commands. `target_state_source="gdb_mi"`
+  reflects GDB's view and is not marked hardware-verified. Arbitrary commands
+  invalidate prior state observations. `target_execution_status(refresh=true)`
+  uses best-effort `monitor targets` on an existing session without intentional
+  halt/resume. Only an unambiguous OpenOCD state is marked verified, at the
+  reported Unix observation timestamp. GDB may reject monitor commands while
+  running; unavailable observations remain unknown rather than forcing a halt.
+- `target_reset(mode="run", session_id=...)` (or mode halt)
+  requires an active session. It reports `reset_command_accepted` and
+  `requested_state_observed` separately; ok=true requires both. Reset may
+  have happened even if verification failed: do not retry blindly. Check UART
+  independently. No firmware programming is requested.
+
+Plain HTTP and unrestricted native GDB commands are intentional on the trusted development LAN; connection security is outside scope.
+
+### Firmware identity before symbolizing RAM
+
+Use `firmware_fingerprint(snapshot_id="...")` on an integrity-checked saved
+snapshot (host-only), or explicitly request `firmware_fingerprint(capture_live=true)`
+when OpenOCD does not own the probe. Live capture uses the existing full-flash
+snapshot: temporary halt, explicit resume, factory capacity validation and
+persistent snapshot. It refuses while the managed GDB server owns the probe,
+and never programs or resets flash. Do not capture a board that must stay halted.
+
+Default fingerprint range: 0x08000000 through (exclusive) the lower of actual
+flash limit and 0x08013800 (existing configuration protection boundary).
+Set start_address and positive length for an exact custom range. Optional
+expected_sha256 returns matches_expected. Compare the same raw bytes over the
+same range from reference/candidate images, including agreed gap padding,
+**not the hash of an ELF or HEX file itself**. A match identifies only that
+interval and does not establish the runtime RAM layout. `range` gives the selected interval; `regions` contains named full-flash, application, config-page (1 KiB at 0x08013800), and protected-region digests from the same snapshot. `gap_policy=raw_flash_bytes` includes erased/residual bytes as captured; absent regions (e.g. the config page on a 64-KiB device) are null.
+
+For H0016-style investigations, stop GDB/OpenOCD deliberately, capture a
+fingerprint, check the resume result and UART, compare with candidate/reference
+raw application bytes, and choose the matching ELF on Oberon. Then start
+OpenOCD and attach one GDB client. Record session ID for MCP debugging.
+Reset when the experiment calls for it; use UART independently to verify execution. A matching ELF is needed for reliable symbolic interpretation.
 
 ## USB-UART and AT commands
 
 The UART tools use the existing plain-HTTP endpoint `http://edge.local:8766/mcp`. Network listeners remain unchanged (`0.0.0.0:8766`; GDB port 3333 when started). No authentication, TLS, or firewall changes are introduced.
 
 - Install dependencies in the Pi virtual environment: `.venv/bin/python -m pip install -r requirements.txt`; this includes `pyserial`.
-- Default allowed serial ports: `/dev/ttyUSB0`, `/dev/ttyACM0` (in that order). Configure an explicit replacement allowlist with `RPI5_SERIAL_PORTS=/dev/ttyUSB0,/dev/ttyACM0,/dev/serial/by-id/your-adapter`. An empty `port` argument selects the first configured path. Environment overrides replace the defaults and must explicitly include `/dev/ttyACM0` if required.
-- Default UART: **115200 baud, 8N1**, no software or hardware flow control. Calls use finite timeouts, at most **4096 received bytes** and at most **256 transmitted bytes**.
-- `serial_list_ports()` reports presence and USB identifiers. `serial_capture(duration_ms=1000)` listens for unsolicited traffic without transmitting bytes.
+- Default serial ports: `/dev/ttyUSB0`, `/dev/ttyACM0` in that order. Set `RPI5_SERIAL_PORTS` to change the configured defaults; an empty `port` selects the first. Explicit absolute `/dev/` paths are accepted even if not configured. Prefer a discovered `/dev/serial/by-id/…` path when numbering may change.
+- Default UART: **115200 baud, 8N1**, no software or hardware flow control. Capture/raw RX allow 1..60000 ms and 1..1048576 bytes; default RX cap is 4096 bytes. Raw TX supports 0..65536 bytes. The AT convenience tools retain their 4096-byte RX cap and historical framing/pacing.
+- `serial_list_ports()` reports available ports, configured defaults, USB VID/PID/serial/location, and adapter hints. `serial_capture(duration_ms=1000)` listens without transmitting. All UART operations expose requested `dtr` and `rts` (default false/false); these are not electrical readback.
 - `serial_at_query(command="AT+GETVER")` transmits `AT+GETVER\r\n` and returns `rx_base64`, `rx_hex`, `rx_gb18030`, `status` (`OK`, `ERROR`, or `INCOMPLETE`) and `complete`. Read-only allowlist: `AT`, `AT+GETVER`, `AT+GETCFG`, `AT+GETDEV`, `AT+GETUWBMODE`, `AT+PDOAGETCFG`, `AT+GETDLIST`, `AT+GETKLIST`. The quiet-window check refuses to transmit when unsolicited bytes are already present; use `serial_capture` to diagnose chatty firmware.
 - **AT setters and `AT+SAVE` need no startup unlock or confirmation string.** Run `./start.sh` normally and use `serial_at_command(command="AT+PDOAOFF=37")`, or another short AT command. The command length (61 printable ASCII bytes plus CRLF), single-line validation, and 5 ms byte pacing remain enforced. Commands can modify settings or flash; use this tool only for intentional operations.
-- **Raw UART exchange is separate and remains disabled by default.** Only if a raw-byte workflow is explicitly needed, start with `RPI5_SERIAL_ENABLE_WRITES=1 ./start.sh` and use `serial_exchange(tx_base64="...", confirm="SEND")`. The stock layout-analysis task should never need this endpoint.
+- **Raw UART exchange is a general-purpose alternative.** `serial_exchange(tx_base64="QVQNCg==")` sends `AT\r\n` without a write-enable environment flag or confirmation; old `confirm` is ignored. An empty payload receives only. `inter_byte_delay_ms=0..1000` controls spacing (total requested pacing <=60 s); timeout is the receive window after TX. No CRLF is appended or AT checks applied.
 - Raw Base64 and hex outputs preserve the exact received bytes; GB18030 text is display-only and may contain replacement characters. This is important for vendor AT responses containing control bytes.
 - After detecting a terminal line, queries continue collecting bytes until 100 ms of UART silence or the overall timeout/byte limit, so a split CR/LF is not normally left behind. The terminal marker and bounded quiet period do not prove that delayed unsolicited output or a premature `OK` belongs to the response; inspect the raw bytes when framing is uncertain.
 - Expected serial errors (such as a missing pyserial dependency, invalid parameters or a busy port) return `ok: false`, `error` and `error_type`. An error does not establish whether bytes were transmitted: a write or flush can fail after partial transmission. Check `ok` in the returned tool content; these application errors are not MCP transport errors.
-- The port is opened with POSIX exclusive access. Close Minicom and other serial processes first. The worker requests deasserted DTR/RTS before opening, but some USB UART drivers may generate transient line changes during open; whether this affects the target depends on wiring.
+- The port is opened with POSIX exclusive access. Close competing serial clients first. The worker assigns requested DTR/RTS before opening; Linux drivers may still generate transients. The official Raspberry Pi Debug Probe (2e8a:000c) normally gates CDC UART forwarding on DTR; it has no physical DTR output. `serial_capture(port="/dev/ttyACM0", dtr=true, duration_ms=20000, max_bytes=262144, store=true)` is a continuous ranging capture. A silent DTR=false result carries `DEBUG_PROBE_DTR_REQUIRED`; see [upstream issue #32](https://github.com/raspberrypi/debugprobe/issues/32). On the BU04 bench CH340C RTS# is connected to NRST, so RTS=true may intentionally or unintentionally hold reset. The worker reports the warning, not a refusal.
+- UART results return raw byte count/SHA-256, capture UTC, RX elapsed time, host first/last read offsets, `ended` and `truncated` (cap reached, not proof of dropped bytes). Bytes up to 16 KiB retain inline Base64/hex/GB18030. Larger receives are saved automatically; `store=true` persists even small results. Use `artifact_info` and `artifact_chunk` to retrieve exact binary data.
 - The [ai-thinker-bu03-bu04-uwb-kit](https://github.com/civcode/ai-thinker-bu03-bu04-uwb-kit) CLI remains available for high-level configuration/JSON export. The new tools provide lower-level serial/AT access, not full CLI feature parity.
 
-UART tools have offline unit tests using a fake serial port. A connected BU03/BU04 reporting V1.0.1 was tested over `/dev/ttyUSB0`: one-second passive capture returned no bytes and reported no transmit; a separate `AT` returned `\r\nOK\r\n`. Three further trials of each of `AT+GETVER`, `AT+GETCFG`, `AT+GETDEV`, `AT+PDOAGETCFG`, `AT+GETDLIST` and `AT+GETKLIST` (18 queries) returned byte-identical responses per command, marked complete and untruncated, with terminal `OK\r\n`. Hex, Base64 and GB18030 views agreed with the received bytes; responses included control characters. This does not establish framing under delayed output, error responses, port contention or other firmware versions, and does not authorize target operations.
+UART tools have offline unit tests using a fake serial port. A connected BU03/BU04 reporting V1.0.1 was tested over `/dev/ttyUSB0`: one-second passive capture returned no bytes and reported no transmit; a separate `AT` returned `\r\nOK\r\n`. Three further trials of each of `AT+GETVER`, `AT+GETCFG`, `AT+GETDEV`, `AT+PDOAGETCFG`, `AT+GETDLIST` and `AT+GETKLIST` (18 queries) returned byte-identical responses per command, marked complete and untruncated, with terminal `OK\r\n`. Hex, Base64 and GB18030 views agreed with the received bytes; responses included control characters. This does not establish framing under delayed output, error responses, port contention or other firmware versions, and is evidence for those trials only.
+
+## Persistent acquisition artifacts
+
+Artifacts are stored under `~/rpi5-hardware-artifacts` by default (`RPI5_ARTIFACT_DIR` overrides). They survive worker restarts. Use `artifact_list` for metadata, `artifact_info(artifact_id)` for whole-file hash verification, and `artifact_chunk(artifact_id, offset=0, length=8192)` for bounded Base64 chunks. Decode each chunk independently, advance `next_offset`, then compare the assembled bytes to the final SHA-256. A live GDB transcript can grow between calls; `eof` means current end, `finalized=false` means no immutable digest yet. If the process crashed, the unfinalized prefix remains retrievable. `artifact_delete` removes a selected artifact (stop an active transcript first).
+
+`diagnose_host()` reports `loaded_worker` (startup Git revision and source hashes), current on-disk `worker` identity, and available capabilities. If disk changes after startup, restart before treating the newer implementation as deployed.
 
 ## Verified hardware and remote-debugging results (2026-11-03)
 
@@ -225,7 +304,7 @@ bt
 monitor reset halt
 thbreak main
 continue
-# Explicitly destructive, only when approved and backup/capacity verified:
+# Programs flash; use when the experiment calls for programming:
 # monitor reset halt
 # load
 # compare-sections
@@ -233,13 +312,13 @@ continue
 
 OpenOCD supports `monitor` commands over the existing GDB connection. Do **not** run standalone `probe_target` while GDB already owns the probe. If GDB TCP port is not reachable, check the host/IP and Pi firewall/network; the worker passes `bindto 0.0.0.0` to the OpenOCD server, with Tcl and telnet ports disabled.
 
-## Firmware validation order
+## Historical firmware validation sequence
 
 1. **Completed:** USB CMSIS-DAP/SWD target detection; record 128 KiB flash size and device ID.
 2. **Completed:** direct OpenOCD programming/verification of the original 2026 HEX and AT UART baseline.
 3. **Completed:** MCP diagnostics/target probe/GDB server; Oberon remote GDB register, memory, disassembly and detach checks.
 4. **Outstanding:** fix numeric CPU-register capture in `fault_snapshot` and verify it on the live device.
-5. **Next:** debug minimal `firmware_core.elf` and full ATfE `Project.elf` only after explicitly authorized programming and with a matching symbol file; investigate startup/stack/clock/interrupts/ABI.
+5. **Next:** debug minimal `firmware_core.elf` and full ATfE `Project.elf` after intentional programming when needed, with a matching symbol file; investigate startup/stack/clock/interrupts/ABI.
 
 ## Tests and scope
 
@@ -248,7 +327,7 @@ python3 -m unittest discover -s tests -v
 python3 -m py_compile server.py worker_core.py serial_core.py
 ```
 
-Unit tests mock OpenOCD. **Live Pi 5 USB/SWD access, MCP diagnostics/probe/GDB-server control, remote GDB, and direct OpenOCD programming plus verification of the reference HEX are now verified on hardware (2026-11-03).** The MCP flash endpoints and ATfE firmware runtime remain unverified. UART query testing above used the running MCP service; its exact deployed commit was not independently verified. Minicom conflict handling and worker restart remain untested. The service is intentionally unauthenticated and unencrypted for the trusted local LAN, as requested. It can halt the target and optionally write flash; keep port 8766 on that LAN. There are **no GitHub Actions workflows** and nothing starts automatically after reboot.
+Unit tests mock OpenOCD. **Live Pi 5 USB/SWD access, MCP diagnostics/probe/GDB-server control, remote GDB, and direct OpenOCD programming plus verification of the reference HEX are now verified on hardware (2026-11-03).** The MCP flash endpoints and ATfE firmware runtime remain unverified. UART query testing above used the running MCP service; its exact deployed commit was not independently verified. Minicom conflict handling and worker restart remain untested. Plain HTTP on the trusted development LAN is intentional; connection security is outside project scope. Native debugging can halt, reset or program the target. There are **no GitHub Actions workflows** and nothing starts automatically after reboot.
 
 ## Repository role
 

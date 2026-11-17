@@ -21,14 +21,12 @@ import time
 import uuid
 
 from firmware_upload import FirmwareUploadManager, UploadError
-from flash_snapshots import FlashSnapshotStore
-from gdb_local import LocalGDB
+from flash_snapshots import APP_FLASH_LIMIT, FlashSnapshotStore, SnapshotError
+from gdb_session import ManagedGDB
 
 
 FLASH_START = 0x08000000
 FLASH_LIMIT = FLASH_START + 128 * 1024
-# ATfE application must not overwrite original NVM/configuration at 0x08013800.
-APP_FLASH_LIMIT = 0x08013800
 MAX_HEX_BYTES = 2 * 1024 * 1024
 MAX_LOG_CHARS = 20_000
 # Fixed allowlist: this host-only diagnostic never invokes OpenOCD's init.
@@ -168,7 +166,7 @@ class OpenOCDWorker:
         self._last_probe_flash_kib: int | None = None  # informational, never a flash authorization
         self._upload_manager = FirmwareUploadManager(self.workspace, inspect_intel_hex, MAX_HEX_BYTES)
         self.flash_snapshots = FlashSnapshotStore()
-        self._gdb_client = LocalGDB()
+        self._gdb_client = ManagedGDB()
         self._closed = False
 
     def close(self) -> None:
@@ -213,6 +211,26 @@ class OpenOCDWorker:
             except (OSError, subprocess.TimeoutExpired) as exc:
                 return {"ok": False, "error": str(exc), "command": cmd}
 
+    def worker_version(self) -> dict:
+        """Git identity on disk, plus hashes of relevant source files."""
+        root = Path(__file__).resolve().parent
+        result = {"revision": None, "branch": None, "dirty": None}
+        for key, args in (("revision", ["rev-parse", "HEAD"]),
+                          ("branch", ["rev-parse", "--abbrev-ref", "HEAD"]),
+                          ("dirty", ["status", "--porcelain"])):
+            try:
+                p = subprocess.run(["git", "-C", str(root), *args], capture_output=True,
+                                   text=True, timeout=3, check=False)
+                if p.returncode == 0:
+                    result[key] = bool(p.stdout.strip()) if key == "dirty" else p.stdout.strip()
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        result["source_files"] = {name: hashlib.sha256((root / name).read_bytes()).hexdigest()
+                                  for name in ("server.py", "worker_core.py", "serial_core.py",
+                                               "gdb_local.py", "gdb_session.py", "artifacts.py")
+                                  if (root / name).is_file()}
+        return result
+
     def diagnose_host(self) -> dict:
         commands = {
             "uname": ["uname", "-a"], "usb_probe": ["lsusb", "-d", "2e8a:000c"],
@@ -226,7 +244,7 @@ class OpenOCDWorker:
                 results[key] = {"exit_code": p.returncode, "output": (p.stdout + p.stderr)[-3000:]}
             except (OSError, subprocess.TimeoutExpired) as exc:
                 results[key] = {"error": str(exc)}
-        return {"host": socket.gethostname(), "tools": results,
+        return {"host": socket.gethostname(), "tools": results, "worker": self.worker_version(),
                 "hint": "Official Debug Probe USB ID is 2e8a:000c; check firmware with lsusb -v."}
 
     def inspect_openocd_host(self) -> dict:
@@ -287,6 +305,36 @@ class OpenOCDWorker:
                 return {"ok": False, "error": "GDB server owns the probe. Stop it before taking a snapshot."}
             return self.flash_snapshots.capture(self._args(speed_khz, quirk), self.workspace, label)
 
+    def firmware_fingerprint(self, snapshot_id: str = "", start_address: int = FLASH_START,
+                             length: int = 0, expected_sha256: str = "",
+                             capture_live: bool = False, speed_khz: int = 1000,
+                             quirk: bool = False) -> dict:
+        """Hash an exact saved flash range, or explicitly capture current flash first."""
+        self.flash_snapshots.validate_fingerprint_range(start_address, length, expected_sha256)
+        if type(capture_live) is not bool or bool(snapshot_id) == capture_live:
+            return {"ok": False, "error": "Specify exactly one of snapshot_id or capture_live=true"}
+        if capture_live:
+            result = self.flash_snapshot(speed_khz, "firmware-fingerprint", quirk)
+            if not result["ok"]:
+                return result
+            snapshot_id = result["snapshot_id"]
+        try:
+            fingerprint = self.flash_snapshots.fingerprint(snapshot_id, start_address, length,
+                                                           expected_sha256)
+        except (SnapshotError, OSError) as exc:
+            if not capture_live:
+                raise
+            # Preserve successful capture/resume evidence if the actual factory
+            # capacity makes the requested fingerprint range invalid.
+            return {"ok": False, "error": str(exc), "source": "live_snapshot",
+                    "snapshot_id": snapshot_id, "resumed": result.get("resumed"),
+                    "flash_kib": result.get("flash_kib")}
+        response = {**fingerprint, "source": "live_snapshot" if capture_live else "saved_snapshot",
+                    "capture_live": capture_live}
+        if capture_live:
+            response["resumed"] = result.get("resumed")
+        return response
+
     def flash_snapshot_info(self, snapshot_id: str) -> dict:
         """Check persistent snapshot hash and metadata; host-only."""
         return self.flash_snapshots.info(snapshot_id)
@@ -326,16 +374,103 @@ class OpenOCDWorker:
                     "mdw 0xE000ED34 1", "mdw 0xE000ED38 1", "shutdown"]
         return self._one_shot(speed_khz, commands, timeout=30, quirk=quirk)
 
-    def gdb_command(self, command: str, timeout_seconds: int = 30) -> dict:
-        """Send a command to the owned, persistent local GDB process."""
+    def _gdb_metadata(self) -> dict:
+        """Called under the worker lock; never contacts the target."""
+        running = self._server_running()
+        status = self._gdb_client.status()
+        if not running and (status["gdb_running"] or status["session_state"] == "active"):
+            self._gdb_client.close("OpenOCD server unavailable", lost=True)
+            status = self._gdb_client.status()
+        return {**status, "openocd_running": running,
+                "openocd_pid": self._process.pid if running else None,
+                "gdb_port": self._port}
+
+    def gdb_session_start(self) -> dict:
         with self._lock:
-            if not self._server_running():
-                self._gdb_client.close()
-                return {"ok": False, "error": "OpenOCD server unavailable; start_gdb_server is required"}
+            metadata = self._gdb_metadata()
+            if not metadata["openocd_running"]:
+                return {"ok": False, "error": "OpenOCD server unavailable; start_gdb_server is required",
+                        **metadata}
+            result = self._gdb_client.start(self._port)
+            after = self._gdb_metadata()
+            if not after["openocd_running"] or after["session_lost"]:
+                return {**result, **after, "ok": False}
+            return {**after, **result}
+
+    def gdb_session_status(self) -> dict:
+        with self._lock:
+            return {"ok": True, **self._gdb_metadata()}
+
+    def gdb_session_stop(self) -> dict:
+        with self._lock:
+            previous = self._gdb_metadata()
+            self._gdb_client.close()
+            return {"ok": True, "stopped": previous["gdb_running"],
+                    **self._gdb_metadata(),
+                    "note": "No halt/resume/reset requested; disconnect behavior depends on OpenOCD."}
+
+    def gdb_command(self, command: str, timeout_seconds: int = 30, session_id: str = "",
+                    wait_for_stop_seconds: int = 0) -> dict:
+        """Send a command to the owned persistent GDB; never retry after loss."""
+        with self._lock:
+            metadata = self._gdb_metadata()
+            if not metadata["openocd_running"]:
+                return {"ok": False, "error": "OpenOCD server unavailable; start_gdb_server is required",
+                        **metadata}
             wrong_host = pi_gdb_file_error(command)
-            if wrong_host:
-                return wrong_host
-            return self._gdb_client.command(command, self._port, timeout_seconds)
+            result = self._gdb_client.command(command, self._port, timeout_seconds, session_id,
+                                              wait_for_stop_seconds=wait_for_stop_seconds)
+            if wrong_host and not result.get("ok"):
+                result["path_hint"] = wrong_host["error"]
+            after = self._gdb_metadata()
+            if not after["openocd_running"]:
+                return {**result, **after, "ok": False,
+                        "error": "OpenOCD server lost during command; target state unknown"}
+            return {**result, **after,
+                    "session_recreated": result.get("session_recreated", False),
+                    "ok": result["ok"] and not after["session_lost"]}
+
+    def target_execution_status(self, refresh: bool = False) -> dict:
+        with self._lock:
+            metadata = self._gdb_metadata()
+            if not refresh:
+                return {"ok": True, **metadata}
+            if not metadata["openocd_running"]:
+                return {"ok": False, "error": "OpenOCD server unavailable", **metadata}
+            result = self._gdb_client.execution_status(refresh=True)
+            after = self._gdb_metadata()
+            if not after["openocd_running"]:
+                return {**result, **after, "ok": False, "error": "OpenOCD server lost"}
+            return {**result, **after, "ok": result["ok"] and not after["session_lost"]}
+
+    def target_reset(self, mode: str, confirm: str = "", session_id: str = "") -> dict:
+        """Explicitly reset existing target session; distinguish acceptance from observation."""
+        with self._lock:
+            metadata = self._gdb_metadata()
+            if mode not in ("run", "halt"):
+                return {"ok": False, "error": "Choose mode run/halt",
+                        **metadata}
+            if not metadata["openocd_running"] or metadata["session_state"] != "active":
+                return {"ok": False, "error": "Explicit gdb_session_start required; no reset requested",
+                        **metadata}
+            result = self._gdb_client.command("monitor reset " + mode, self._port, 30,
+                                              session_id, require_existing=True)
+            after = self._gdb_metadata()
+            result = {**result, **after,
+                      "ok": result["ok"] and after["openocd_running"] and not after["session_lost"]}
+            accepted = result.get("result_class") == "done"
+            observed = (accepted and result.get("state_probe", {}).get("ok") is True and
+                        result.get("target_state_verified") is True and
+                        result.get("target_state") == {"run": "running", "halt": "halted"}[mode] and
+                        not result.get("session_lost"))
+            response = {**metadata, **result, "requested_mode": mode,
+                        "reset_command_accepted": accepted,
+                        "requested_state_observed": observed,
+                        "ok": accepted and observed and result["ok"]}
+            if accepted and not observed:
+                response["warning"] = ("Reset accepted but requested state not observed; "
+                                       "do not retry blindly. Check UART or execution status.")
+            return response
 
     def start_gdb_server(self, speed_khz: int = 100, port: int = 3333, quirk: bool = False) -> dict:
         validate_speed(speed_khz)
@@ -367,6 +502,7 @@ class OpenOCDWorker:
                     return {"ok": False, "error": "OpenOCD exited before GDB became available", **self.server_status()}
                 try:
                     with socket.create_connection(("127.0.0.1", port), timeout=0.3):
+                        self._gdb_client.prepare_server()
                         return {"ok": True, **self.server_status()}
                 except OSError:
                     time.sleep(0.2)
@@ -384,9 +520,11 @@ class OpenOCDWorker:
                 with log_path.open("rb") as f:
                     f.seek(max(0, log_path.stat().st_size - MAX_LOG_CHARS))
                     tail = f.read().decode("utf-8", errors="replace")
-            return {"running": running, "local_gdb_running": self._gdb_client.running(),
-                    "gdb_port": self._port, "gdb_host": socket.gethostname(),
-                    "pid": self._process.pid if self._process else None, "recent_log": tail[-5000:]}
+            metadata = self._gdb_metadata()
+            return {"running": running, "local_gdb_running": metadata["gdb_running"],
+                    "gdb_host": socket.gethostname(),
+                    "pid": self._process.pid if self._process else None, "recent_log": tail[-5000:],
+                    **metadata}
 
     def stop_gdb_server(self) -> dict:
         with self._lock:
@@ -428,7 +566,7 @@ class OpenOCDWorker:
         """Cancel a partial upload and remove its temporary file; never touches target."""
         return self._upload_manager.abort(upload_id)
 
-    def flash_preflight(self, artifact_id: str) -> dict:
+    def flash_preflight(self, artifact_id: str, allow_protected: bool = False) -> dict:
         """Non-disruptive host-only flash plan; hardware capacity checked during flash_hex.
 
         Does not reset, halt, resume, attach OpenOCD or transmit UART data.
@@ -454,7 +592,7 @@ class OpenOCDWorker:
             protected_overlap = end > APP_FLASH_LIMIT
             server_busy = self._server_running()
             reasons = []
-            if protected_overlap:
+            if protected_overlap and not allow_protected:
                 reasons.append("IMAGE_OVERLAPS_PROTECTED_FLASH")
             if server_busy:
                 reasons.append("GDB_SERVER_OWNS_PROBE")
@@ -466,6 +604,9 @@ class OpenOCDWorker:
                 "protected_region": {"start": f"0x{APP_FLASH_LIMIT:08x}",
                                      "end_exclusive": f"0x{FLASH_LIMIT:08x}"},
                 "protected_overlap": protected_overlap,
+                "allow_protected": allow_protected,
+                "warnings": (["Image overlaps historical BU04 configuration region; programming may erase it."]
+                             if protected_overlap else []),
                 "gdb_server_owns_probe": server_busy,
                 "target_flash_kib": self._last_probe_flash_kib,
                 "capacity_status": ("CACHED_PREVIOUS_PROBE_RECHECK_AT_FLASH"
@@ -521,13 +662,12 @@ class OpenOCDWorker:
                     "data_bytes": image["data_bytes"]}
 
     def flash_hex(self, artifact_id: str, confirm_sha256: str, confirm: str = "", speed_khz: int = 100,
-                  quirk: bool = False) -> dict:
-        if confirm != "FLASH":
-            return {"ok": False, "error": "Explicit confirmation required: confirm='FLASH'"}
+                  quirk: bool = False, allow_protected: bool = False) -> dict:
+        # The digest validates the intended staged bytes; legacy confirm is ignored.
         with self._lock:
             if self._server_running():
                 return {"ok": False, "error": "Stop GDB server before standalone flash. Alternatively use GDB 'load'."}
-            preflight = self.flash_preflight(artifact_id)
+            preflight = self.flash_preflight(artifact_id, allow_protected)
             if not preflight.get("ok"):
                 return preflight
             if not preflight["ready_for_flash_request"]:
@@ -552,5 +692,7 @@ class OpenOCDWorker:
             cmd = ["init; reset halt; program {" + image["path"].as_posix() + "} verify reset exit"]
             result = self._one_shot(speed_khz, cmd, timeout=180, quirk=quirk)
             result["target_flash_kib"] = cap
+            result["protected_overlap"] = preflight["protected_overlap"]
+            result["warnings"] = preflight["warnings"]
             result["sha256"] = image["digest"]
             return result

@@ -20,6 +20,8 @@ import uuid
 
 
 FLASH_START = 0x08000000
+# Project layout: application must not overlap original NVM/configuration.
+APP_FLASH_LIMIT = 0x08013800
 ALLOWED_FLASH_KIB = (64, 128)
 PAGE_BYTES = 1024
 _ID = re.compile(r"[0-9a-f]{32}\Z")
@@ -49,6 +51,21 @@ def snapshot_tool_result(operation, *args, **kwargs) -> dict:
 
 def _sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def region_digests(data: bytes) -> dict:
+    """Hash the same captured raw bytes, including erased bytes and gaps."""
+    end = FLASH_START + len(data)
+    app_end = min(APP_FLASH_LIMIT, end)
+    def value(start, stop):
+        if stop <= start or stop > end:
+            return None
+        return {"start_address": f"0x{start:08X}", "end_exclusive": f"0x{stop:08X}",
+                "length": stop-start, "sha256": _sha(data[start-FLASH_START:stop-FLASH_START])}
+    return {"gap_policy": "raw_flash_bytes", "regions": {
+        "full_flash": value(FLASH_START, end), "application": value(FLASH_START, app_end),
+        "config_page": value(APP_FLASH_LIMIT, APP_FLASH_LIMIT + PAGE_BYTES),
+        "protected_region": value(APP_FLASH_LIMIT, end)}}
 
 
 def _check_id(value: str, name: str = "snapshot_id") -> str:
@@ -157,7 +174,43 @@ class FlashSnapshotStore:
                 info.get("length") != info["flash_kib"] * 1024 or
                 len(data) != info["length"] or _sha(data) != info.get("sha256")):
             raise SnapshotError(f"Snapshot failed integrity verification: {snapshot_id}")
-        return data, info
+        return data, {**info, **region_digests(data)}
+
+    @staticmethod
+    def validate_fingerprint_range(start_address: int, length: int,
+                                   expected_sha256: str = "") -> None:
+        limit = FLASH_START + max(ALLOWED_FLASH_KIB) * 1024
+        if (type(start_address) is not int or type(length) is not int or
+                not FLASH_START <= start_address < limit or
+                length < 0 or start_address + length > limit or
+                (length == 0 and start_address >= APP_FLASH_LIMIT)):
+            raise SnapshotError("Fingerprint range must fit main flash; length=0 selects application end")
+        if not isinstance(expected_sha256, str) or (expected_sha256 and
+                not re.fullmatch(r"[0-9a-fA-F]{64}", expected_sha256)):
+            raise SnapshotError("expected_sha256 must be empty or 64 hexadecimal characters")
+
+    def fingerprint(self, snapshot_id: str, start_address: int = FLASH_START,
+                    length: int = 0, expected_sha256: str = "") -> dict:
+        """Hash raw captured flash bytes, not an ELF or a sparse HEX file."""
+        self.validate_fingerprint_range(start_address, length, expected_sha256)
+        data, info = self._read(snapshot_id)
+        offset = start_address - FLASH_START
+        if length == 0:
+            length = min(len(data), APP_FLASH_LIMIT - FLASH_START) - offset
+        if length <= 0 or offset + length > len(data):
+            raise SnapshotError("Fingerprint range exceeds captured factory flash capacity")
+        digest = _sha(data[offset:offset + length])
+        return {"ok": True, "snapshot_id": snapshot_id,
+                "captured_utc": info.get("captured_utc"), "flash_kib": info["flash_kib"],
+                "snapshot_resumed": info.get("resumed"),
+                "start_address": f"0x{start_address:08X}",
+                "end_exclusive": f"0x{start_address + length:08X}", "length": length,
+                "sha256": digest, "snapshot_sha256": info["sha256"], **region_digests(data),
+                "range": {"start_address": f"0x{start_address:08X}",
+                          "end_exclusive": f"0x{start_address+length:08X}", "length": length},
+                "matches_expected": digest == expected_sha256.lower() if expected_sha256 else None,
+                "includes_protected_region": start_address + length > APP_FLASH_LIMIT,
+                "note": "Compare binary bytes over exactly this address interval, not ELF/HEX file hashes."}
 
     def info(self, snapshot_id: str) -> dict:
         _, info = self._read(snapshot_id)
@@ -231,7 +284,7 @@ class FlashSnapshotStore:
                     "captured_utc": datetime.now(timezone.utc).isoformat(),
                     "flash_start": f"0x{FLASH_START:08X}", "flash_kib": kib,
                     "length": len(data), "sha256": _sha(data),
-                    "resumed": True}
+                    "resumed": True, **region_digests(data)}
             metadata.write_text(json.dumps(info, indent=2) + "\n", encoding="utf-8")
             return {"ok": True, **info, "path": str(binary),
                     "output": output[-_MAX_LOG:],
